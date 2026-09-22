@@ -487,6 +487,8 @@ class ObjectCache2:
                 continue
 
             duplis.exported_obj.has_duplicates = True
+            print(f"[duplicate_instances] batch base={duplis.exported_obj.parts[0].lux_obj if duplis.exported_obj.parts else '?'} "
+                  f"extra_count={duplis.get_count()} num_parts={len(duplis.exported_obj.parts)}")
 
             for part in duplis.exported_obj.parts:
                 src_name = part.lux_obj

@@ -50,12 +50,15 @@ class ExportedObject(ExportedData):
         return utils.luxutils.create_props(prefix, definitions)
 
     def delete(self, luxcore_scene):
+        print(f"[ExportedObject.delete] has_duplicates={self.has_duplicates} parts={[p.lux_obj for p in self.parts]}")
         for part in self.parts:
             luxcore_scene.DeleteObject(part.lux_obj)
             if self.has_duplicates:
                 # The rest of the batch's instances live in this separate,
                 # duplicated LuxCore object, not tracked as their own ExportedObject
-                luxcore_scene.DeleteObject(part.lux_obj + "dupli")
+                dupli_name = part.lux_obj + "dupli"
+                print(f"[ExportedObject.delete] also deleting duplicated batch object: {dupli_name}")
+                luxcore_scene.DeleteObject(dupli_name)
 
 
 class ExportedLight(ExportedData):
