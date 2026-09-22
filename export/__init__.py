@@ -169,8 +169,9 @@ class Exporter(object):
             # Export was cancelled by user
             return None
 
-        if is_viewport_render:
-            self.visibility_cache.init(depsgraph, context)
+        # Always init (cheap), so a persistent-data final/animation render can
+        # also diff visibility between frames, same as viewport already does
+        self.visibility_cache.init(depsgraph, context)
 
         # Motion blur
         # Motion blur seems not to work in viewport render, i.e. matrix_world
@@ -380,7 +381,7 @@ class Exporter(object):
         self.scene = None
         return changes
 
-    def get_changes(self, depsgraph, context=None, changes=None):
+    def get_changes(self, depsgraph, context=None, changes=None, force_diff=False):
         self.scene = depsgraph.scene_eval
         final = context is None
 
@@ -390,6 +391,17 @@ class Exporter(object):
         if not final:
             if changes is None:
                 changes = self.get_viewport_changes(depsgraph, context)
+
+        if changes is None:
+            changes = Change.NONE
+
+        # force_diff: used by final/animation render with persistent data enabled,
+        # to detect changes between animation frames the same way viewport does
+        # (camera is not diffed here in the viewport case, get_viewport_changes()
+        # above already did it)
+        if not final or force_diff:
+            if final and self.camera_cache.diff(self, self.scene, depsgraph, context):
+                changes |= Change.CAMERA
 
             if self.object_cache2.diff(depsgraph):
                 changes |= Change.OBJECT
@@ -405,9 +417,6 @@ class Exporter(object):
 
             if self.world_cache.diff(depsgraph):
                 changes |= Change.WORLD
-
-        if changes is None:
-            changes = Change.NONE
 
         # Relevant during final render
         imagepipeline_props = imagepipeline.convert(depsgraph.scene, context)
@@ -533,13 +542,13 @@ class Exporter(object):
 
         if changes & Change.WORLD:
             if (
-                not context.scene.world
-                or context.scene.world.luxcore.light == "none"
+                not self.scene.world
+                or self.scene.world.luxcore.light == "none"
             ):
                 luxcore_scene.DeleteLight(WORLD_BACKGROUND_LIGHT_NAME)
 
             world_props = world.convert(
-                self, depsgraph, context.scene, is_viewport_render=True
+                self, depsgraph, self.scene, is_viewport_render=context is not None
             )
             props.Set(world_props)
 

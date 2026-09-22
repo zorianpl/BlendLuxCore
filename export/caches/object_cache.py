@@ -849,9 +849,9 @@ class ObjectCache2:
                     dg_update.id, bpy.types.Object
                 ):
                     obj = dg_update.id
-                    if not utils.is_obj_visible(
-                        obj
-                    ) or not obj.visible_in_viewport_get(context.space_data):
+                    if not utils.is_obj_visible(obj) or (
+                        context and not obj.visible_in_viewport_get(context.space_data)
+                    ):
                         continue
 
                     if obj.type in MESH_OBJECTS:

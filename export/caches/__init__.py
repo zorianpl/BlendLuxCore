@@ -76,7 +76,7 @@ class VisibilityCache:
     def init(self, depsgraph, context):
         self.last_visible_objects = self._get_visible_objects(depsgraph, context)
 
-    def diff(self, depsgraph, context):
+    def diff(self, depsgraph, context=None):
         visible_objs = self._get_visible_objects(depsgraph, context)
         self.objects_to_remove = self.last_visible_objects - visible_objs
         self.has_new_objects = bool(visible_objs - self.last_visible_objects)
@@ -93,7 +93,12 @@ class VisibilityCache:
             if dg_obj_instance.show_self:
                 # For duplis, check visibility of parent (emitter)
                 obj = dg_obj_instance.parent if dg_obj_instance.parent else dg_obj_instance.object
-                if obj.luxcore.exclude_from_render or not obj.visible_in_viewport_get(context.space_data):
+                if obj.luxcore.exclude_from_render:
+                    continue
+                # In viewport, also respect the viewport-only visibility toggles.
+                # Final render has no space_data/viewport, render visibility is
+                # already covered by exclude_from_render/hide_render above.
+                if context and not obj.visible_in_viewport_get(context.space_data):
                     continue
                 keys.add(utils.make_key_from_instance(dg_obj_instance))
         return keys
