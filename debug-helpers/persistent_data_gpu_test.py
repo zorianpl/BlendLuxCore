@@ -41,6 +41,7 @@ SAMPLES = 6
 FRAMES = [1, 2, 7, 2, 7, 2, 7, 1]
 RES_X = 320
 RES_Y = 180
+OUTPUT_DIR = ""  # e.g. r"C:\temp\persistent_data_test" -- "" disables saving images
 # --------------------------------------------------------------------
 
 if "--" in sys.argv:
@@ -51,7 +52,12 @@ if "--" in sys.argv:
         elif arg == "--samples" and i + 1 < len(argv):
             SAMPLES = int(argv[i + 1])
         elif arg == "--frames" and i + 1 < len(argv):
-            FRAMES = [int(x) for x in argv[i + 1].split(",")]
+            frames_arg = argv[i + 1]
+            if "-" in frames_arg and "," not in frames_arg:
+                start, end = frames_arg.split("-")
+                FRAMES = list(range(int(start), int(end) + 1))
+            else:
+                FRAMES = [int(x) for x in frames_arg.split(",")]
         elif arg == "--res" and i + 2 < len(argv):
             RES_X, RES_Y = int(argv[i + 1]), int(argv[i + 2])
 
@@ -86,10 +92,46 @@ utils_view_layer.State.active_view_layer = view_layer.name
 
 
 def rss_mb():
-    with open("/proc/self/status") as f:
-        for line in f:
-            if line.startswith("VmRSS:"):
-                return int(line.split()[1]) / 1024
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass  # Not on Linux
+
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except ImportError:
+        pass
+
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return counters.WorkingSetSize / (1024 * 1024)
+    except Exception:
+        pass
+
     return -1
 
 
@@ -112,12 +154,21 @@ session = None
 renderconfig = None
 results = []
 
+force_full_export = any(
+    getattr(obj.luxcore, "always_reexport", False) for obj in bpy.data.objects
+)
+if force_full_export:
+    print("[persistent_data_gpu_test] always_reexport is set on at least one "
+          "object -> every frame will do a FULL export (no persistent data)")
+
 for idx, f in enumerate(FRAMES):
     scene.frame_set(f)
     depsgraph = bpy.context.evaluated_depsgraph_get()
 
     t0 = time.time()
-    if session is None:
+    if session is None or force_full_export:
+        if session is not None:
+            session.Stop()
         exporter = export.Exporter()
         session = exporter.create_session(depsgraph, context=None, engine=None, view_layer=view_layer)
         renderconfig = session.GetRenderConfig()
@@ -133,6 +184,15 @@ for idx, f in enumerate(FRAMES):
     export_time = time.time() - t0
 
     run_to_halt(session)
+
+    if OUTPUT_DIR:
+        import os
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        out_path = os.path.join(OUTPUT_DIR, f"step{idx:03d}_frame{f:04d}.png")
+        session.GetFilm().SaveOutput(
+            out_path, pyluxcore.FilmOutputType.RGB_IMAGEPIPELINE, pyluxcore.Properties()
+        )
+        print(f"  saved: {out_path}")
 
     lum = session.GetFilm().GetFilmY()
     stats = session.GetStats()

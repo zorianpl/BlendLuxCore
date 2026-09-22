@@ -18,6 +18,13 @@ DESC_EXCLUDE_FROM_RENDER = (
     "The object will be excluded from render. "
     "Useful if you need objects to render for other engines, but not for LuxCore"
 )
+DESC_ALWAYS_REEXPORT = (
+    "Force this object's instances to be re-checked every frame during a persistent-data "
+    "animation render (mesh/material data is still cached, only the instance list is re-evaluated), "
+    "even if Blender's dependency graph does not flag a change. Use this for objects whose "
+    "Geometry Nodes visibility logic depends on something (e.g. camera position) that may not "
+    "reliably trigger automatic change detection"
+)
 
 
 class LuxCoreObjectProps(PropertyGroup):
@@ -31,6 +38,11 @@ class LuxCoreObjectProps(PropertyGroup):
     )
     enable_motion_blur: BoolProperty(
         name="Motion Blur", default=True, description=DESC_MOTION_BLUR
+    )
+    always_reexport: BoolProperty(
+        name="Always Re-check (Persistent Data)",
+        default=False,
+        description=DESC_ALWAYS_REEXPORT,
     )
     use_proxy: BoolProperty(
         name="Use Proxy",

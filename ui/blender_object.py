@@ -34,6 +34,7 @@ class LUXCORE_OBJECT_PT_object(ObjectButtonsPanel, Panel):
         col.prop(obj.luxcore, "id")
         col.prop(obj.luxcore, "visible_to_camera")
         col.prop(obj.luxcore, "exclude_from_render")
+        col.prop(obj.luxcore, "always_reexport")
 
         proxy_box = col.box()
         proxy_box.prop(obj.luxcore, "use_proxy")
