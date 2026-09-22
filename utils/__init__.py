@@ -19,6 +19,8 @@ import os
 import itertools
 from os.path import basename, dirname
 import tomllib
+from .. import __package__ as base_package
+from .. import __file__ as base_package_path
 
 _needs_reload = "bpy" in locals()
 import bpy
@@ -676,20 +678,23 @@ def count_index(func):
     return wrapper
 
 
-ADDON_NAME = "BlendLuxCore"
-
-def get_module_name():
+def get_module_id():
     """Get module name (bl_idname) for current addon."""
-    components = __package__.split('.')
-    prefix = list(itertools.takewhile(lambda x: x != ADDON_NAME, components))
-    prefix.append(ADDON_NAME)
-    return '.'.join(prefix)
+    return base_package
+
+
+def get_module_path():
+    """Get absolute path to module."""
+    return pathlib.Path(base_package_path).parent
+
+
+# Alias kept for code that was written against the (broken) get_module_name()
+get_module_name = get_module_id
 
 
 def get_addon_preferences(context):
     """Get addon_preferences handle."""
-    addon_name = get_module_name()
-    return context.preferences.addons[addon_name].preferences
+    return context.preferences.addons[base_package].preferences
 
 
 def get_version_string():
