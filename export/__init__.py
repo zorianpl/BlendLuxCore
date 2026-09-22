@@ -537,10 +537,16 @@ class Exporter(object):
                     print("Could not remove object with key", key, "(not in exported_objects, likely batched)")
 
             if self.visibility_cache.objects_to_remove:
+                # Disabled, same family of bug as RemoveUnusedMeshes() below: these
+                # can incorrectly remove materials/textures/imagemaps that are still
+                # referenced by unrelated, unchanged objects (observed: an unrelated
+                # static object losing its texture/material after a VISIBILITY-driven
+                # cleanup elsewhere in the scene)
                 # luxcore_scene.RemoveUnusedMeshes()  # TODO for some reason this deletes even some meshes that are still in use
-                luxcore_scene.RemoveUnusedMaterials()
-                luxcore_scene.RemoveUnusedTextures()
-                luxcore_scene.RemoveUnusedImageMaps()
+                # luxcore_scene.RemoveUnusedMaterials()
+                # luxcore_scene.RemoveUnusedTextures()
+                # luxcore_scene.RemoveUnusedImageMaps()
+                pass
 
         if changes & Change.WORLD:
             if (
