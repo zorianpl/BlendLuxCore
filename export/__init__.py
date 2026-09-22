@@ -525,14 +525,16 @@ class Exporter(object):
 
         if changes & Change.VISIBILITY:
             for key in self.visibility_cache.objects_to_remove:
-                print("Removing object with key", key)
-
                 try:
                     exported_obj = self.object_cache2.exported_objects.pop(key)
                     exported_obj.delete(luxcore_scene)
+                    print("Removed object with key", key)
                 except KeyError:
                     # This is ok, not every exportable object is added to exported_objects
-                    pass
+                    # (e.g. batched/duplicated instances only have ONE entry in
+                    # exported_objects per batch, not one per instance - so most
+                    # individual instance keys from VisibilityCache will miss here)
+                    print("Could not remove object with key", key, "(not in exported_objects, likely batched)")
 
             if self.visibility_cache.objects_to_remove:
                 # luxcore_scene.RemoveUnusedMeshes()  # TODO for some reason this deletes even some meshes that are still in use
