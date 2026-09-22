@@ -23,6 +23,10 @@ class ExportedObject(ExportedData):
         self.parts = []
         self.visible_to_camera = visible_to_camera
         self.obj_id = obj_id
+        # Set by ObjectCache2.duplicate_instances() when this object is the base
+        # of a batch: LuxCore holds the other instances as a SEPARATE object per
+        # part, named "<part.lux_obj>dupli", that delete() below must also remove
+        self.has_duplicates = False
 
         for (shape_name, mat_index), mat_name in zip(mesh_definitions, mat_names):
             obj_name = lux_name_base + str(mat_index)
@@ -48,6 +52,10 @@ class ExportedObject(ExportedData):
     def delete(self, luxcore_scene):
         for part in self.parts:
             luxcore_scene.DeleteObject(part.lux_obj)
+            if self.has_duplicates:
+                # The rest of the batch's instances live in this separate,
+                # duplicated LuxCore object, not tracked as their own ExportedObject
+                luxcore_scene.DeleteObject(part.lux_obj + "dupli")
 
 
 class ExportedLight(ExportedData):
