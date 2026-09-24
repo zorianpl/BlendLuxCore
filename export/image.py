@@ -40,6 +40,7 @@ class ImageExporter:
             try:
                 temp_image = cls.temp_images[key]
                 print(f"[BLC] '{key}' already exported - skip")
+                result.append(temp_image.name)
                 continue
             except KeyError:
                 pass
@@ -85,7 +86,21 @@ class ImageExporter:
                 f"[BLC] Warning: image '{image.name}' contains multiple "
                 "packed files but only one will be used"
             )
-        return result[0] if result else None
+
+        if not result:
+            # Every packed tile failed to save (see the "[BLC] Warning:
+            # could not save image." line(s) above for the reason). Raise
+            # instead of silently returning None: an OSError here is caught
+            # by callers (e.g. imagemap.py sub_export) and turned into a
+            # visible fallback color + warning, instead of a None/invalid
+            # "file" property reaching LuxCore's scene properties, which
+            # causes a confusing crash much later (MakeTx).
+            raise OSError(
+                f"Could not save any packed data of image '{image.name}' "
+                "to a temp file"
+            )
+
+        return result[0]
 
     @classmethod
     def export(cls, image, image_user, scene):

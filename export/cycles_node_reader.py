@@ -15,30 +15,48 @@ math_operation_map = {
 }
 
 
-def convert(material, props, luxcore_name, obj_name=""):
+def convert(material, props, luxcore_name, obj_name="", force_holdout=False):
     # print("Converting Cycles node tree of material", material.name_full)
+    # Note: luxcore_name already has "_holdout" suffix if force_holdout=True (added in material.py)
+
     output = material.node_tree.get_output_node("CYCLES")
     if output is None:
-        return black(luxcore_name)
+        return black(luxcore_name, force_holdout)
 
     link = utils_node.get_link(output.inputs["Surface"])
     if link is None:
-        return black(luxcore_name)
+        return black(luxcore_name, force_holdout)
 
     result = _node(link.from_node, link.from_socket, props, material, luxcore_name, obj_name)
     if result == ERROR_VALUE:
-        return black(luxcore_name)
+        return black(luxcore_name, force_holdout)
 
     assert result == luxcore_name
+
+    # Override: If force_holdout, set holdout.enable flag
+    if force_holdout:
+        prefix = "scene.materials." + luxcore_name + "."
+        import pyluxcore
+        props.Set(pyluxcore.Property(prefix + "holdout.enable", True))
+
     return luxcore_name, props
 
 
-def black(luxcore_name="__BLACK__"):
+def black(luxcore_name="__BLACK__", force_holdout=False):
     props = pyluxcore.Properties()
-    props.SetFromString("""
-    scene.materials.{mat_name}.type = matte
-    scene.materials.{mat_name}.kd = 0
-    """.format(mat_name=luxcore_name))
+
+    if force_holdout:
+        props.SetFromString("""
+        scene.materials.{mat_name}.type = matte
+        scene.materials.{mat_name}.kd = 0
+        scene.materials.{mat_name}.holdout.enable = true
+        """.format(mat_name=luxcore_name))
+    else:
+        props.SetFromString("""
+        scene.materials.{mat_name}.type = matte
+        scene.materials.{mat_name}.kd = 0
+        """.format(mat_name=luxcore_name))
+
     return luxcore_name, props
 
 
@@ -171,8 +189,32 @@ def _node(node, output_socket, props, material, luxcore_name=None, obj_name="", 
                 }
         
         # Attach these props to the right-most material node (regardless if it's glass, disney or a mix mat)
+
+        # Fix for issue #1091: Only add emission if actually used
+        # Blender 3.6 uses "Emission", Blender 4.0+ renamed it to "Emission Color"
+        emission_color_socket_name = "Emission Color" if "Emission Color" in node.inputs else "Emission"
+        emission_color_socket = node.inputs[emission_color_socket_name]
+        emission_strength_socket = node.inputs["Emission Strength"]
+
+        emission_update = {}
+        color_is_linked = emission_color_socket.is_linked
+        strength_is_linked = emission_strength_socket.is_linked
+        color_default = list(emission_color_socket.default_value)[:3]
+        color_is_nonzero = any(c > 0 for c in color_default)
+        strength_is_nonzero = emission_strength_socket.default_value > 0
+
+        if color_is_linked or strength_is_linked or (color_is_nonzero and strength_is_nonzero):
+            emission_color = _socket(emission_color_socket, props, material, obj_name, group_node_stack)
+            emission_strength = _socket(emission_strength_socket, props, material, obj_name, group_node_stack)
+            emission_tex_name = luxcore_name + "_em"
+            props.Set(utils.luxutils.create_props(
+                "scene.textures." + emission_tex_name + ".",
+                {"type": "scale", "texture1": emission_strength, "texture2": emission_color},
+            ))
+            emission_update["emission"] = emission_tex_name
+
         definitions.update({
-            "emission": _socket(node.inputs["Emission Strength"], props, material, obj_name, group_node_stack),
+            **emission_update,
             "transparency": _socket(node.inputs["Alpha"], props, material, obj_name, group_node_stack),
             "bumptex": _socket(node.inputs["Normal"], props, material, obj_name, group_node_stack),
         })

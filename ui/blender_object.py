@@ -34,6 +34,16 @@ class LUXCORE_OBJECT_PT_object(ObjectButtonsPanel, Panel):
         col.prop(obj.luxcore, "id")
         col.prop(obj.luxcore, "visible_to_camera")
         col.prop(obj.luxcore, "exclude_from_render")
+        col.prop(obj.luxcore, "always_reexport")
+
+        proxy_box = col.box()
+        proxy_box.prop(obj.luxcore, "use_proxy")
+        proxy_sub = proxy_box.column()
+        proxy_sub.enabled = obj.luxcore.use_proxy
+        proxy_sub.prop(obj.luxcore, "scene_shape")
+        if obj.type == "MESH":
+            proxy_box.prop(obj.luxcore, "proxy_apply_modifiers")
+            proxy_box.operator("luxcore.generate_proxy", icon="EXPORT")
 
         # Motion blur settings
         cam = context.scene.camera

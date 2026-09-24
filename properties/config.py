@@ -70,6 +70,23 @@ SEED_DESC = (
 )
 ANIM_SEED_DESC = "Use different seed values for different frames"
 
+PERSISTENT_DATA_ANIMATION_DESC = (
+    "Experimental: keep a single LuxCore render session alive across all "
+    "frames of an animation render, instead of re-exporting and "
+    "re-uploading the whole scene from scratch on every frame. The camera "
+    "is always re-parsed each frame; everything else is exported once, on "
+    "the first frame, and then treated as static -- except objects (or "
+    "their Geometry Nodes / Collection Instance parent) with 'Always "
+    "Re-check (Persistent Data)' enabled in Object Properties, which are "
+    "re-checked and refreshed every frame too. This mirrors how other "
+    "engines with a similar persistent-session model (e.g. Octane) "
+    "handle animated scenes: nothing is inferred from Blender's own "
+    "change tracking, everything is static by default, and you "
+    "explicitly mark what actually needs to keep changing. See the "
+    "'Always Re-check' tooltip for why. Has no effect on single-frame "
+    "(F12) renders"
+)
+
 SOBOL_ADAPTIVE_STRENGTH_DESC = (
     "A value of 0 means that each pixel is sampled equally, higher values "
     "focus more samples on noisy areas of the image"
@@ -555,6 +572,14 @@ class LuxCoreConfig(PropertyGroup):
     # Seed
     seed: IntProperty(name="Seed", default=1, min=1, description=SEED_DESC)
     use_animated_seed: BoolProperty(name="Animated Seed", default=False, description=ANIM_SEED_DESC)
+
+    # Persistent Data (Animation) -- see engine/final.py's
+    # _render_layer_persistent_data_animation() and
+    # PERSISTENT_DATA_ANIMATION_NOTES.md for the full background.
+    use_persistent_data_animation: BoolProperty(
+        name="Persistent Data (Animation)", default=False,
+        description=PERSISTENT_DATA_ANIMATION_DESC,
+    )
 
     # Min. epsilon settings (drawn in ui/units.py)
     show_min_epsilon: BoolProperty(name="Advanced LuxCore Settings", default=False,

@@ -22,7 +22,9 @@ from . import (
     mesh_converter,
 )
 from .light import WORLD_BACKGROUND_LIGHT_NAME
-from .caches.object_cache import supports_live_transform
+from .caches.object_cache import (
+    supports_live_transform, Duplis, _is_always_reexport_flagged,
+)
 
 if _needs_reload:
     import importlib
@@ -94,6 +96,38 @@ class Exporter(object):
         self.imagepipeline_cache = caches.StringCache()
         self.halt_cache = caches.StringCache()
         self.motion_blur_enabled = False
+        # Set by callers doing persistent-data animation rendering (a live
+        # RenderSession reused across frames via BeginSceneEdit/EndSceneEdit,
+        # see debug-helpers/persistent_data_gpu_test.py) to force
+        # use_instancing=True for every object, including ones that would
+        # otherwise get their world transform baked directly into the mesh
+        # (ObjectCache2._compute_use_instancing()). Confirmed by testing
+        # (2026-09-23, PERSISTENT_DATA_ANIMATION_NOTES.md): a baked-transform
+        # mesh (DefineMeshExt(transformation=...)) gets its transform
+        # corrupted (multiplied by itself, once) on a live session that
+        # later applies an unrelated scene edit -- the exact same Python-side
+        # export was verified correct (single bake, right values, no
+        # re-export) and this does NOT reproduce with a normal one-shot
+        # final render (fresh session per frame), so the bug is inside
+        # LuxCore's live BeginSceneEdit/EndSceneEdit handling of that
+        # specific code path, not in this addon's export logic. Objects that
+        # already use_instancing=True (transform sent as a separate
+        # scene.objects.<key>.transformation property instead of baked into
+        # geometry) were not affected. Has no effect on a normal final
+        # render (this flag stays False there).
+        self.persistent_data_animation = False
+
+        # obj_keys of always_reexport-flagged groups exported by the last
+        # call to update_flagged_only() (see that method) -- lets it
+        # notice a flagged group that VANISHED (became invisible) since
+        # last call, so it can be explicitly removed from the live
+        # LuxCore scene. The main loop there only ever visits VISIBLE
+        # instances, so without this a flagged object that became
+        # invisible was never cleaned up at all (confirmed by testing:
+        # it stayed rendered forever, until it reappeared and the
+        # already-existing "drop old version before recreating" step
+        # incidentally deleted it one frame late).
+        self.flagged_reexport_keys = set()
 
         # A dictionary with the following mapping:
         # {node_key: luxcore_name}
@@ -169,8 +203,9 @@ class Exporter(object):
             # Export was cancelled by user
             return None
 
-        if is_viewport_render:
-            self.visibility_cache.init(depsgraph, context)
+        # Always init (cheap), so a persistent-data final/animation render can
+        # also diff visibility between frames, same as viewport already does
+        self.visibility_cache.init(depsgraph, context)
 
         # Motion blur
         # Motion blur seems not to work in viewport render, i.e. matrix_world
@@ -380,7 +415,7 @@ class Exporter(object):
         self.scene = None
         return changes
 
-    def get_changes(self, depsgraph, context=None, changes=None):
+    def get_changes(self, depsgraph, context=None, changes=None, force_diff=False):
         self.scene = depsgraph.scene_eval
         final = context is None
 
@@ -390,6 +425,17 @@ class Exporter(object):
         if not final:
             if changes is None:
                 changes = self.get_viewport_changes(depsgraph, context)
+
+        if changes is None:
+            changes = Change.NONE
+
+        # force_diff: used by final/animation render with persistent data enabled,
+        # to detect changes between animation frames the same way viewport does
+        # (camera is not diffed here in the viewport case, get_viewport_changes()
+        # above already did it)
+        if not final or force_diff:
+            if final and self.camera_cache.diff(self, self.scene, depsgraph, context):
+                changes |= Change.CAMERA
 
             if self.object_cache2.diff(depsgraph):
                 changes |= Change.OBJECT
@@ -405,9 +451,6 @@ class Exporter(object):
 
             if self.world_cache.diff(depsgraph):
                 changes |= Change.WORLD
-
-        if changes is None:
-            changes = Change.NONE
 
         # Relevant during final render
         imagepipeline_props = imagepipeline.convert(depsgraph.scene, context)
@@ -474,6 +517,267 @@ class Exporter(object):
         # because it might have been replaced in _update_config()
         return session
 
+    def update_camera_only(self, depsgraph, session):
+        """
+        Persistent-data animation, v23 (2026-09-23): deliberately does NOT
+        look at depsgraph.updates / Change detection / ObjectCache2.update()
+        at all -- every object, material, light, world and instance is
+        treated as 100% static after the first frame's first_run(). The
+        ONLY thing re-parsed on this live session, every frame, is the
+        camera.
+
+        Why: ObjectCache2.update()'s per-instance diffing (the
+        "object_instances" loop in object_cache.py) has no way to
+        recognize an instance that already belongs to an existing,
+        unchanged hybrid-batched group -- only the group's single "base"
+        object is tracked in exported_objects, so every OTHER member
+        instance looks brand new to that loop, every single time it runs,
+        regardless of whether anything actually moved. And it runs
+        whenever Change.OBJECT fires for ANY reason anywhere in the scene
+        (see get_changes()), not just for the group that changed. On a
+        heavily hybrid-batched scene this makes update() slower than a
+        full first_run() -- confirmed by the user, not a hypothesis (see
+        PERSISTENT_DATA_ANIMATION_NOTES.md). A proper fix (teach the
+        object_instances loop to recognize and skip unchanged batch
+        members, and bulk-rebatch only groups that truly changed) is
+        still needed for a version where OBJECTS also animate. This
+        method is for the case where the camera is the only thing that
+        actually needs to move between frames: it sidesteps the whole
+        problem by never calling into that code path at all.
+
+        Camera-only BeginSceneEdit/EndSceneEdit on a live session was
+        already confirmed cheap and safe by prior testing (viewport
+        render continuously moves the camera through this exact same
+        path with no expensive recompile -- see the "v8 postmortem" in
+        debug-helpers/persistent_data_gpu_test.py).
+
+        Caller is responsible for keeping this ONE session alive across
+        ALL frames from within a single continuous render() call (see
+        that same script's module docstring for why a live session must
+        never be kept alive *across separate* render() invocations).
+        """
+        scene = depsgraph.scene_eval
+        luxcore_scene = session.GetRenderConfig().GetScene()
+
+        session.BeginSceneEdit()
+        try:
+            self.camera_cache.diff(self, scene, depsgraph, None)
+            luxcore_scene.Parse(self.camera_cache.props)
+        except Exception as error:
+            LuxCoreErrorLog.add_error(error)
+            import traceback
+
+            traceback.print_exc()
+
+        try:
+            session.EndSceneEdit()
+        except RuntimeError as error:
+            import traceback
+
+            traceback.print_exc()
+            LuxCoreErrorLog.add_error(error)
+            print("Fatal error, stopping session.")
+            session.Stop()
+            raise
+
+        if session.IsInPause():
+            session.Resume()
+
+        return session
+
+    def update_flagged_only(self, depsgraph, session, view_layer=None):
+        """
+        2026-09-24 fix (v2 -- the first attempt was incomplete): a
+        flagged group that became INVISIBLE was never cleaned up at
+        all -- the main loop below only ever visits currently-visible
+        instances, so disappearance had no handler on its own.
+
+        self.flagged_reexport_keys tracks which obj_keys currently
+        belong to flagged groups, so a group missing from this call's
+        visible set can be explicitly removed below. It is seeded and
+        maintained in exactly TWO places, both computing obj_key from
+        the SAME dg_obj_instance that was actually used to create/find
+        the entry, in the SAME loop iteration -- never re-derived by a
+        separate, later walk over depsgraph.object_instances:
+        - first_run() (ObjectCache2.first_run(), object_cache.py),
+          right where it creates a NEW batch for a flagged group.
+        - This method's own loop, below.
+        The first version of this fix seeded flagged_reexport_keys via
+        a SEPARATE function (compute_flagged_visible_keys(), since
+        removed) that re-walked depsgraph.object_instances after
+        first_run() already ran and guessed which instance first_run()
+        had used as each batch's base. Confirmed by testing (real
+        production scene, a flagged Geometry-Nodes-driven forest) that
+        this guess is systematically wrong, not randomly: the "removed
+        N vanished group(s)" count was never 0, but the actual
+        `.pop(obj_key, None)` lookup silently missed every time,
+        deleting nothing (a coincidental, unrelated object happened to
+        share that count once, which is what made it initially look
+        like partial success). Instances stayed visible on every frame
+        of a present -> absent -> present test. Root-caused to the
+        second, independent walk landing on a different "first"
+        instance than first_run()'s own single pass did -- eliminated
+        entirely by recording the key at the source instead of
+        guessing it afterwards.
+
+        v24 (2026-09-23): update_camera_only() plus a targeted, bulk
+        refresh of exactly the objects/instancing-parents flagged with
+        obj.luxcore.always_reexport -- nothing else. Still no
+        depsgraph.updates inspection, no Change detection, no touching
+        any other object: same "explicit, not inferred" philosophy as
+        update_camera_only(), extended to cover a small, user-designated
+        set of meshes that DO need to move/change, instead of freezing
+        literally everything but the camera.
+
+        Key difference from ObjectCache2.update()'s existing (slow, see
+        PERSISTENT_DATA_ANIMATION_NOTES.md) per-instance fallback: this
+        re-batches flagged groups the SAME way first_run() does --
+        grouped by (mesh, visibility, holdout) with ONE bulk
+        duplicate_instances()/DuplicateObject() call per group -- instead
+        of calling _convert_obj() once per instance. Cost is proportional
+        to the number of flagged GROUPS, not the number of flagged
+        INSTANCES.
+
+        Still has to walk depsgraph.object_instances once to find which
+        instances belong to a flagged object/parent (Blender has no
+        "give me only instances of X" API) -- that enumeration itself is
+        cheap (one flag check per instance); what's skipped is the
+        expensive per-instance _convert_obj() conversion for every non-
+        flagged instance in the scene.
+
+        Any previously exported version of a flagged group is deleted
+        from the live LuxCore scene first, so a group whose instance
+        count or positions changed doesn't leak the old dupli objects or
+        end up double-batched.
+        """
+        scene = depsgraph.scene_eval
+        luxcore_scene = session.GetRenderConfig().GetScene()
+        object_cache2 = self.object_cache2
+
+        session.BeginSceneEdit()
+        try:
+            self.camera_cache.diff(self, scene, depsgraph, None)
+            luxcore_scene.Parse(self.camera_cache.props)
+
+            scene_props = pyluxcore.Properties()
+            instances = {}
+            dropped_keys = set()
+            seen_obj_keys = set()
+            seen_names = set()
+            flagged_but_filtered = []
+
+            for dg_obj_instance in depsgraph.object_instances:
+                obj = dg_obj_instance.object
+
+                if not _is_always_reexport_flagged(obj, dg_obj_instance):
+                    continue
+                if obj.type not in utils.MESH_OBJECTS:
+                    flagged_but_filtered.append((obj.name, f"wrong type: {obj.type}"))
+                    continue
+                if not utils.is_instance_visible(dg_obj_instance, obj, None):
+                    flagged_but_filtered.append((obj.name, "not visible"))
+                    continue
+
+                seen_names.add(obj.name)
+                # 2026-09-24: must match first_run()'s batch_key exactly
+                # (object_cache.py) -- segregated by instancing-parent
+                # identity too, so a flagged mesh shared with some OTHER,
+                # unflagged instancing source (or a second, independent
+                # flagged group) never merges into the same batch. Every
+                # instance reaching this point is already confirmed
+                # flagged (see the `continue` above), so this is
+                # unconditional here.
+                parent = dg_obj_instance.parent
+                batch_key = (
+                    obj.original.as_pointer(), False, False,
+                    parent.original.as_pointer() if parent else None,
+                )
+
+                if batch_key not in instances:
+                    # First instance of this flagged group seen this call:
+                    # drop whatever we exported for it before (if
+                    # anything), so re-batching below starts clean.
+                    if batch_key not in dropped_keys:
+                        dropped_keys.add(batch_key)
+                        obj_key = utils.make_key_from_instance(dg_obj_instance)
+                        seen_obj_keys.add(obj_key)
+                        old = object_cache2.exported_objects.pop(obj_key, None)
+                        if old is not None:
+                            old.delete(luxcore_scene)
+
+                    exported_obj = object_cache2._convert_obj(
+                        self, dg_obj_instance, obj, depsgraph, luxcore_scene,
+                        scene_props, False, view_layer, None,
+                    )
+                    if exported_obj:
+                        instances[batch_key] = Duplis(exported_obj)
+                    else:
+                        instances[batch_key] = None
+                    continue
+
+                duplis = instances[batch_key]
+                if duplis is None:
+                    continue
+                obj_id = obj.original.luxcore.id
+                if obj_id == -1:
+                    obj_id = dg_obj_instance.random_id & 0xFFFFFFFE
+                duplis.object_ids.append(obj_id)
+                duplis.matrices.extend(
+                    pyluxcore.BlenderMatrix4x4ToList(
+                        dg_obj_instance.matrix_world.copy()
+                    )
+                )
+
+            luxcore_scene.Parse(scene_props)
+            object_cache2.duplicate_instances(instances, luxcore_scene, self.stats)
+
+            # The loop above only ever visits VISIBLE instances -- a
+            # flagged group that became invisible since the last call
+            # never shows up in it at all, so without this it was never
+            # cleaned up. Remove anything we were tracking last call
+            # that didn't show up as visible+flagged this call. Every
+            # key in flagged_reexport_keys was recorded at its source
+            # (see this method's docstring) -- if pop() ever misses
+            # here now, that's a real, different bug, not the stale
+            # second-guess this replaced.
+            vanished_keys = self.flagged_reexport_keys - seen_obj_keys
+            actually_removed = 0
+            for obj_key in vanished_keys:
+                old = object_cache2.exported_objects.pop(obj_key, None)
+                if old is not None:
+                    old.delete(luxcore_scene)
+                    actually_removed += 1
+            self.flagged_reexport_keys = seen_obj_keys
+
+            print(
+                f"[update_flagged_only] refreshed {len(instances)} flagged "
+                f"group(s) {sorted(seen_names)}, {len(vanished_keys)} "
+                f"vanished (actually removed: {actually_removed})"
+            )
+            if flagged_but_filtered:
+                print(f"[update_flagged_only] flagged but skipped: {flagged_but_filtered}")
+        except Exception as error:
+            LuxCoreErrorLog.add_error(error)
+            import traceback
+
+            traceback.print_exc()
+
+        try:
+            session.EndSceneEdit()
+        except RuntimeError as error:
+            import traceback
+
+            traceback.print_exc()
+            LuxCoreErrorLog.add_error(error)
+            print("Fatal error, stopping session.")
+            session.Stop()
+            raise
+
+        if session.IsInPause():
+            session.Resume()
+
+        return session
+
     def update_session(self, changes, session):
         if changes & Change.IMAGEPIPELINE:
             session.Parse(self.imagepipeline_cache.props)
@@ -503,8 +807,12 @@ class Exporter(object):
             props.Set(self.camera_cache.props)
 
         if changes & Change.OBJECT:
+            # Get original view_layer from evaluated (evaluated doesn't work correctly with indirect_only_get)
+            view_layer_eval = depsgraph.view_layer_eval
+            scene_orig = depsgraph.scene_eval.original
+            view_layer = scene_orig.view_layers.get(view_layer_eval.name)
             self.object_cache2.update(
-                self, depsgraph, luxcore_scene, props, context
+                self, depsgraph, luxcore_scene, props, context, view_layer
             )
 
         if changes & Change.MATERIAL:
@@ -512,30 +820,38 @@ class Exporter(object):
 
         if changes & Change.VISIBILITY:
             for key in self.visibility_cache.objects_to_remove:
-                print("Removing object with key", key)
-
                 try:
                     exported_obj = self.object_cache2.exported_objects.pop(key)
                     exported_obj.delete(luxcore_scene)
+                    print("Removed object with key", key)
                 except KeyError:
                     # This is ok, not every exportable object is added to exported_objects
-                    pass
+                    # (e.g. batched/duplicated instances only have ONE entry in
+                    # exported_objects per batch, not one per instance - so most
+                    # individual instance keys from VisibilityCache will miss here)
+                    print("Could not remove object with key", key, "(not in exported_objects, likely batched)")
 
             if self.visibility_cache.objects_to_remove:
+                # Disabled, same family of bug as RemoveUnusedMeshes() below: these
+                # can incorrectly remove materials/textures/imagemaps that are still
+                # referenced by unrelated, unchanged objects (observed: an unrelated
+                # static object losing its texture/material after a VISIBILITY-driven
+                # cleanup elsewhere in the scene)
                 # luxcore_scene.RemoveUnusedMeshes()  # TODO for some reason this deletes even some meshes that are still in use
-                luxcore_scene.RemoveUnusedMaterials()
-                luxcore_scene.RemoveUnusedTextures()
-                luxcore_scene.RemoveUnusedImageMaps()
+                # luxcore_scene.RemoveUnusedMaterials()
+                # luxcore_scene.RemoveUnusedTextures()
+                # luxcore_scene.RemoveUnusedImageMaps()
+                pass
 
         if changes & Change.WORLD:
             if (
-                not context.scene.world
-                or context.scene.world.luxcore.light == "none"
+                not self.scene.world
+                or self.scene.world.luxcore.light == "none"
             ):
                 luxcore_scene.DeleteLight(WORLD_BACKGROUND_LIGHT_NAME)
 
             world_props = world.convert(
-                self, depsgraph, context.scene, is_viewport_render=True
+                self, depsgraph, self.scene, is_viewport_render=context is not None
             )
             props.Set(world_props)
 

@@ -1,6 +1,9 @@
 from contextlib import contextmanager
 from time import time
+import os
+import re
 import numpy as np
+import pyluxcore
 
 _needs_reload = "bpy" in locals()
 
@@ -15,6 +18,18 @@ if _needs_reload:
 
     importlib.reload(caches)
     importlib.reload(utils)
+
+# Diagnostic (2026-09-23, PERSISTENT_DATA_ANIMATION_NOTES.md "ROOT CAUSE
+# FOUND AND FIXED" section): tracks shape names that have already been
+# DefineMeshExt()'d with a baked-in transformation (use_instancing=False
+# case, see below). If the SAME name gets baked again later, that's either
+# a legitimate re-bake with fresh geometry (fine, e.g. mesh actually
+# edited) or, if LuxCore's DefineMeshExt compounds the given
+# `transformation` with what a same-named shape already had instead of
+# replacing it outright, the exact mechanism of the origin/scale-doubling
+# bug. Deliberately never cleared -- any repeat bake across the whole run
+# is worth flagging regardless of when it happens.
+_baked_transform_names = set()
 
 
 # https://blenderartists.org/t/\
@@ -48,6 +63,59 @@ def convert(
     exporter=None,
 ):
     start_time = time()
+
+    if (
+        hasattr(obj.luxcore, "use_proxy")
+        and obj.luxcore.use_proxy
+        and obj.luxcore.scene_shape != ""
+    ):
+        ply_path = bpy.path.abspath(obj.luxcore.scene_shape)
+
+        if not os.path.exists(ply_path):
+            LuxCoreErrorLog.add_warning(f"PLY file not found: {ply_path}", obj_name=obj.name)
+            return None
+
+        # If the given file ends in a numeric suffix (e.g. "tree007.ply"), treat it as
+        # one part of a multi-material proxy: LuxCore's filesaver ("Only write LuxCore
+        # scene") splits a multi-material mesh into one PLY per used material index,
+        # using exactly this naming scheme. We auto-discover the sibling files so the
+        # user only has to point at one of them, instead of listing every material by hand.
+        # The suffix is always exactly 3 digits (material index, zero padded). Matching more
+        # would swallow digits belonging to the object name, e.g. "Cube.006" + "001" is
+        # "Cube.006001" and must give material index 1, not 6001.
+        directory, filename = os.path.split(ply_path)
+        match = re.match(r"^(.*?)(\d{3})(\.ply)$", filename, re.IGNORECASE)
+
+        parts = {}
+        if match:
+            base_name, _, ext = match.groups()
+            sibling_pattern = re.compile(
+                rf"^{re.escape(base_name)}(\d{{3}}){re.escape(ext)}$", re.IGNORECASE
+            )
+            for entry in os.listdir(directory):
+                entry_match = sibling_pattern.match(entry)
+                if entry_match:
+                    mat_index = int(entry_match.group(1))
+                    parts[mat_index] = os.path.join(directory, entry)
+        else:
+            # No numeric suffix found, fall back to a single-material proxy
+            parts[0] = ply_path
+
+        scene_props = pyluxcore.Properties()
+        mesh_definitions = []
+        for mat_index, part_path in sorted(parts.items()):
+            shape_key = f"{mesh_key}_{mat_index:03d}"
+            prefix = "scene.shapes." + shape_key + "."
+            scene_props.Set(pyluxcore.Property(prefix + "type", "mesh"))
+            scene_props.Set(pyluxcore.Property(prefix + "ply", part_path))
+            mesh_definitions.append((shape_key, mat_index))
+
+        luxcore_scene.Parse(scene_props)
+
+        if exporter and exporter.stats:
+            exporter.stats.export_time_meshes.value += time() - start_time
+
+        return caches.exported_data.ExportedMesh(mesh_definitions)
 
     with _prepare_mesh(obj, depsgraph) as mesh:
         if mesh is None:
@@ -141,6 +209,21 @@ def convert(
 
 
             print(f"[BLC] - Submesh #{mat:03d}: {len(mat_triangles)} triangles")
+
+            if mesh_transform is not None:
+                translation = (
+                    round(float(mesh_transform[0][3]), 5),
+                    round(float(mesh_transform[1][3]), 5),
+                    round(float(mesh_transform[2][3]), 5),
+                )
+                if name in _baked_transform_names:
+                    print(f"[diag] !!! RE-BAKE of {name!r} with a transformation -- "
+                          f"this shape name already had a transform baked in once "
+                          f"before. translation this bake: {translation}")
+                else:
+                    _baked_transform_names.add(name)
+                    print(f"[diag] first bake of {name!r} with a transformation "
+                          f"(use_instancing=False). translation: {translation}")
 
             luxcore_scene.DefineMeshExt(
                 name=name,

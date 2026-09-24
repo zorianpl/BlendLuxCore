@@ -148,7 +148,9 @@ def convert(exporter, scene, context=None, engine=None):
         return props
     except Exception as error:
         import traceback
+        print("=" * 20, "[DIAG] aovs.convert() FAILED, see traceback below", "=" * 20)
         traceback.print_exc()
+        print("=" * 20, "[DIAG] end of aovs.convert() traceback", "=" * 20)
         LuxCoreErrorLog.add_warning("AOVs: %s" % error)
         return pyluxcore.Properties()
 

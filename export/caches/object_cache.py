@@ -2,6 +2,7 @@ import bpy
 from array import array
 from functools import lru_cache
 from time import time
+import hashlib
 
 from ... import utils
 import pyluxcore
@@ -210,7 +211,7 @@ def get_material(obj, material_index, depsgraph):
 
 
 def export_material(
-    obj, material_index, exporter, depsgraph, is_viewport_render
+    obj, material_index, exporter, depsgraph, is_viewport_render, force_holdout=False
 ):
     mat = get_material(obj, material_index, depsgraph)
 
@@ -220,7 +221,7 @@ def export_material(
         mat = mat.original
 
         lux_mat_name, mat_props = material.convert(
-            exporter, depsgraph, mat, is_viewport_render, obj.name
+            exporter, depsgraph, mat, is_viewport_render, obj.name, force_holdout
         )
         node_tree = mat.luxcore.node_tree
         return lux_mat_name, mat_props, node_tree
@@ -266,6 +267,73 @@ def supports_live_transform(particle_system):
         return True
     total_particles = get_total_particle_count(particle_system, True)
     return total_particles <= MAX_PARTICLES_FOR_LIVE_TRANSFORM
+
+
+def _is_always_reexport_flagged(obj, dg_obj_instance):
+    """Whether obj (or its instancing parent) has obj.luxcore.always_reexport
+    set. Shared by _wants_individual_tracking() (viewport batching decision),
+    first_run()'s Persistent Data (Animation) key-seeding, and
+    Exporter.update_flagged_only() -- one place for this check instead of it
+    being copy-pasted in three places with a chance to drift out of sync."""
+    if getattr(obj.luxcore, "always_reexport", False):
+        return True
+    parent = dg_obj_instance.parent
+    return parent is not None and getattr(parent.luxcore, "always_reexport", False)
+
+
+def _wants_individual_tracking(obj, dg_obj_instance):
+    # Hybrid batching merges same-mesh dupli instances into ONE
+    # ExportedObject + N-1 DuplicateObject() copies in LuxCore; a batch is
+    # only ever built once (first_run()) and its base key checked for
+    # removal via VisibilityCache -- update() never re-batches, so an
+    # instance-count change on an already-batched group is only ever
+    # correctly picked up when the group goes to exactly zero. Skipping
+    # batching entirely makes every instance individually tracked under its
+    # own key instead, the same way a manually hidden/shown object already
+    # is -- slower and heavier on LuxCore-side memory, but reliably
+    # re-evaluated every diff frame. Manual opt-in only:
+    # obj.luxcore.always_reexport, set by the user on the object (or on the
+    # Collection Instance empty that hosts a "Duplicate Collection" setup),
+    # see DESC_ALWAYS_REEXPORT in properties/blender_object.py.
+    #
+    # There used to also be automatic detection here (any Geometry Nodes
+    # modifier on the instancing parent), added after a second Collection
+    # Instance object without the manual flag reproduced the same
+    # "doesn't disappear" bug as the first one. Reverted (2026-09-23): on a
+    # heavy production scene (millions of instances, many GN systems, most
+    # of them with a stable instance count that never actually needed this)
+    # it forced every single GN-sourced instance group out of hybrid
+    # batching, turning one fast batched DuplicateObject() C++ call per
+    # group into one Python _convert_obj() call per instance -- a
+    # confirmed severe regression (80s/frame -> still not done after
+    # several minutes). Correctness for the few GN systems that actually
+    # need this is back to being the user's responsibility to flag by hand;
+    # see PERSISTENT_DATA_ANIMATION_NOTES.md for the reasoning either way.
+    #
+    # 2026-09-24: the caller (first_run(), see the "Persistent Data
+    # (Animation) exception" comment there) ignores this function's
+    # result entirely when exporter.persistent_data_animation is True
+    # -- that mode has its own, cheaper mechanism
+    # (Exporter.update_flagged_only()) for keeping a flagged group
+    # correctly updated across frames, and doesn't need frame 1 itself
+    # to pay the individual-tracking cost.
+    return _is_always_reexport_flagged(obj, dg_obj_instance)
+
+
+def _compute_use_instancing(exporter, dg_obj_instance, obj, is_viewport_render):
+    # Objects with displacement in the node tree are instanced to avoid discrepancies between viewport and final render
+    # Proxy objects are always instanced too: their geometry is loaded from an external file in local
+    # space (not baked with the object's transform), so the object's own transform must always be sent
+    # to the engine separately - which only happens on the instancing path (see ExportedObject.get_props).
+    return (
+        is_viewport_render
+        or getattr(exporter, "persistent_data_animation", False)
+        or dg_obj_instance.is_instance
+        or utils.can_share_mesh(obj.original)
+        or (exporter.motion_blur_enabled and obj.luxcore.enable_motion_blur)
+        or uses_displacement(obj)
+        or (hasattr(obj.luxcore, "use_proxy") and obj.luxcore.use_proxy)
+    )
 
 
 def _update_stats(
@@ -320,6 +388,24 @@ class ObjectCache2:
         is_viewport_render = bool(context)
         instances = {}
 
+        # Hybrid batching: Conditional + Smart
+        # Check once if scene uses indirect_only/holdout to avoid per-instance overhead
+        scene_uses_indirect_or_holdout = False
+        if view_layer:
+            def check_layer_coll(lc):
+                if lc.indirect_only or lc.holdout:
+                    return True
+                for child in lc.children:
+                    if check_layer_coll(child):
+                        return True
+                return False
+            scene_uses_indirect_or_holdout = check_layer_coll(view_layer.layer_collection)
+
+            if scene_uses_indirect_or_holdout:
+                print(f"[Export] Hybrid batching: Scene uses indirect_only/holdout - full smart batching")
+            else:
+                print(f"[Export] Hybrid batching: Scene clean - fast batching")
+
         if engine:
             obj_count_estimate = max(1, get_obj_count_estimate(depsgraph))
         else:
@@ -330,6 +416,7 @@ class ObjectCache2:
 
         for index, dg_obj_instance in enumerate(depsgraph.object_instances):
             obj = dg_obj_instance.object
+            is_flagged = _is_always_reexport_flagged(obj, dg_obj_instance)
 
             if (
                 dg_obj_instance.is_instance
@@ -340,7 +427,51 @@ class ObjectCache2:
                     )
                 )
                 and obj.type in MESH_OBJECTS
+                # Smart batching: always allow batching, group by (mesh, visibility) later
+                # Persistent Data (Animation) exception (2026-09-24):
+                # _wants_individual_tracking() exists so VIEWPORT's
+                # update() (which never re-batches) can still see and
+                # update a flagged object. That reasoning doesn't apply
+                # here -- update_flagged_only() (export/__init__.py)
+                # already correctly deletes+rebuilds the WHOLE bulk
+                # batch (base + all dupliN copies) for a flagged group
+                # when needed, and paying the individual-tracking cost
+                # on frame 1 (one _convert_obj() call per instance
+                # instead of one bulk DuplicateObject()) bought nothing
+                # yet, since nothing has changed on frame 1 -- confirmed
+                # by testing: forced this scene's whole flagged forest
+                # through individual conversion on frame 1 alone,
+                # turning a fast bulk export into an "insanely long"
+                # one, for no benefit. Skip it entirely in this mode.
+                and not (
+                    is_flagged
+                    and not getattr(exporter, "persistent_data_animation", False)
+                )
             ):
+                if not dg_obj_instance.show_self:
+                    # 2026-09-24 fix: a non-showing entry in a nested
+                    # instancing hierarchy (e.g. the "outer" Collection-
+                    # Info-level placeholder of a "Duplicate Collection"
+                    # GN setup -- see PERSISTENT_DATA_ANIMATION_NOTES.md,
+                    # "nested Collection-Info double-entry" -- both levels
+                    # can share this batch_key). _convert_obj() itself
+                    # already skips non-showing instances (checks
+                    # dg_obj_instance.show_self before exporting anything)
+                    # -- but if THIS happened to be the FIRST instance
+                    # encountered for a batch_key, the code below used to
+                    # permanently mark the whole batch unexportable
+                    # (instances[batch_key] = None), silently discarding
+                    # every OTHER, actually-showing instance of the same
+                    # mesh too (confirmed by testing: a whole flagged
+                    # Geometry Nodes forest never got exported at all on
+                    # some frames, with zero error/diagnostic output,
+                    # depending purely on which instance Blender's
+                    # enumeration happened to yield first that frame).
+                    # Skip it outright instead, touching `instances` not
+                    # at all, so the next instance sharing this batch_key
+                    # still gets a fresh, un-poisoned attempt.
+                    continue
+
                 # This code is optimized for large amounts of duplis. Drawback is that objects generated from this
                 # code can't be transformed later in a viewport render session (due to BlendLuxCore implementation
                 # reasons, not because of LuxCore)
@@ -351,10 +482,70 @@ class ObjectCache2:
                         engine, obj.name, " (dupli)", index, obj_count_estimate
                     )
 
+                # Hybrid batching: Conditional + Smart
+                if scene_uses_indirect_or_holdout:
+                    # Full smart batching: Calculate visibility and holdout per instance
+                    instance_visible = utils.visible_to_camera(dg_obj_instance, is_viewport_render, view_layer)
+
+                    # Holdout overrides indirect_only
+                    check_obj = dg_obj_instance.parent if dg_obj_instance.is_instance else obj
+                    is_holdout = utils.is_holdout_object(check_obj.original, view_layer)
+
+                    if is_holdout:
+                        instance_visible = True  # Holdout needs to be visible to camera to cut hole
+
+                    # Key: (mesh_pointer, camerainvisible, is_holdout)
+                    # Must distinguish holdout vs normal visible - they need different materials!
+                    camerainvisible = not instance_visible
+                    batch_key = (obj.original.as_pointer(), camerainvisible, is_holdout)
+                else:
+                    # Fast batching: Simple key without per-instance overhead
+                    # All instances assumed visible, no holdout/indirect_only checks
+                    batch_key = (obj.original.as_pointer(), False, False)  # (mesh, camerainvisible=False, is_holdout=False)
+
+                # 2026-09-24 fix: batch_key above is PURELY by mesh identity
+                # -- it has no notion of which instancing source (GN
+                # modifier, plain Collection Instance, etc.) produced a
+                # given instance. Confirmed by testing: if a flagged
+                # object's mesh is ALSO instanced by some other,
+                # unflagged source (e.g. a second GN group, or a plain
+                # Collection Instance referencing the same Collection),
+                # they silently merge into ONE shared batch. Whichever
+                # source's instance is enumerated first becomes the
+                # batch's base -- if that happens to be the unflagged
+                # one, the flagged instances just get appended as extra
+                # duplicate matrices, the batch's key never enters
+                # Exporter.flagged_reexport_keys, and update_flagged_
+                # only() never touches it: an always_reexport-flagged
+                # group can look completely inert forever if it shares
+                # a mesh with anything unflagged. And if the base
+                # happens to belong to a flagged GN group instead,
+                # deleting that group's now-stale batch on disappearance
+                # wipes out every OTHER source's instances of the same
+                # mesh too, permanently (confirmed: two GN groups
+                # sharing one Collection, hiding the first made the
+                # second's instances vanish and never come back).
+                # Fix: segregate by instancing-parent identity too, but
+                # ONLY for flagged instances -- unflagged content keeps
+                # today's exact batch_key (None appended, same grouping,
+                # zero behavior/performance change for the vast majority
+                # of a scene that's never flagged). A flagged mesh shared
+                # by N distinct sources now gets up to N separate
+                # batches instead of one shared/ambiguous one -- each
+                # still one bulk DuplicateObject() call, cost scales
+                # with distinct SOURCES for that mesh, not instances.
+                if is_flagged:
+                    parent = dg_obj_instance.parent
+                    batch_key = batch_key + (
+                        parent.original.as_pointer() if parent else None,
+                    )
+                else:
+                    batch_key = batch_key + (None,)
+
                 try:
                     # The code in this try block is performance-critical, as it is
                     # executed most often when exporting millions of instances.
-                    duplis = instances[obj.original.as_pointer()]
+                    duplis = instances[batch_key]
                     # If duplis is None, then a non-exportable object like a curve with zero faces is being duplicated
                     if duplis:
                         obj_id = dg_obj_instance.object.original.luxcore.id
@@ -393,12 +584,29 @@ class ObjectCache2:
                     if exported_obj:
                         # Note, the transformation matrix and object ID of this first instance is not added
                         # to the duplication list, since it already exists in the scene
-                        instances[obj.original.as_pointer()] = Duplis(
+                        # Smart batching: Store by (mesh, visibility) key
+                        instances[batch_key] = Duplis(
                             exported_obj
                         )
+                        # Persistent Data (Animation) (2026-09-24): record
+                        # the exact obj_key this batch's base got registered
+                        # under, straight from THIS iteration's
+                        # dg_obj_instance -- not re-derived later by a
+                        # second, separate walk over depsgraph.
+                        # object_instances (confirmed by testing: a second
+                        # pass can genuinely land on a different "first"
+                        # instance than this one, silently pointing
+                        # Exporter.update_flagged_only()'s vanish-cleanup
+                        # at the wrong key). Only recorded in this mode --
+                        # normal/viewport rendering has no use for it.
+                        if getattr(exporter, "persistent_data_animation", False) \
+                                and is_flagged:
+                            exporter.flagged_reexport_keys.add(
+                                utils.make_key_from_instance(dg_obj_instance)
+                            )
                     else:
                         # Could not export the object, happens e.g. with curve objects with zero faces
-                        instances[obj.original.as_pointer()] = None
+                        instances[batch_key] = None
             else:
                 # This code is for singular objects and for duplis that should be movable later in a viewport render
                 if not utils.is_instance_visible(
@@ -444,6 +652,8 @@ class ObjectCache2:
                 # Only one instance was created (and is already present in the luxcore_scene), nothing to duplicate
                 continue
 
+            duplis.exported_obj.duplicate_count = duplis.get_count()
+
             for part in duplis.exported_obj.parts:
                 src_name = part.lux_obj
                 dst_name = src_name + "dupli"
@@ -473,6 +683,17 @@ class ObjectCache2:
         #         print(key, "mesh is None")
 
     def _get_mesh_key(self, obj, use_instancing, is_viewport_render=True):
+        if hasattr(obj.luxcore, "use_proxy") and obj.luxcore.use_proxy and obj.luxcore.scene_shape != "":
+            # Proxy geometry comes from the file path, not from obj.data. Different objects can
+            # point at different proxy files while sharing the same (irrelevant) placeholder mesh
+            # data, e.g. linked duplicates - so the cache key must be based on the resolved path,
+            # not on obj.data, or they would wrongly share/overwrite each other's cached geometry.
+            # Hashed rather than used raw, since the path (slashes, drive letters, spaces) would
+            # otherwise end up embedded in LuxCore SDL shape/property names.
+            abspath = bpy.path.abspath(obj.luxcore.scene_shape)
+            path_hash = hashlib.md5(abspath.encode("utf-8")).hexdigest()[:16]
+            return "proxy_" + path_hash
+
         # Important: we need the data of the original object, not the evaluated one.
         # The instancing state has to be part of the key because a non-instanced mesh
         # has its transformation baked-in and can't be used by other instances.
@@ -542,8 +763,10 @@ class ObjectCache2:
 
                             self.exported_hair[obj_key] = lux_shape
                         if lux_shape:
+                            # Check if object is in holdout layer collection
+                            force_holdout = utils.is_holdout_object(obj.original, view_layer)
                             lux_mat, mat_props, node_tree = export_material(
-                                obj, 0, exporter, depsgraph, is_viewport_render
+                                obj, 0, exporter, depsgraph, is_viewport_render, force_holdout
                             )
                             scene_props.Set(mat_props)
                             set_hair_props(
@@ -645,8 +868,10 @@ class ObjectCache2:
                         self.exported_hair[psys_key] = lux_shape
 
                 if lux_shape:
+                    # Check if object is in holdout layer collection
+                    force_holdout = utils.is_holdout_object(obj.original, view_layer)
                     lux_mat, mat_props, node_tree = export_material(
-                        obj, mat_index, exporter, depsgraph, is_viewport_render
+                        obj, mat_index, exporter, depsgraph, is_viewport_render, force_holdout
                     )
                     scene_props.Set(mat_props)
                     set_hair_props(
@@ -688,17 +913,7 @@ class ObjectCache2:
         view_layer,
     ):
         transform = dg_obj_instance.matrix_world
-
-        # Objects with displacement in the node tree are instanced to avoid discrepancies between viewport and final render
-        use_instancing = (
-            is_viewport_render
-            or dg_obj_instance.is_instance
-            or utils.can_share_mesh(obj.original)
-            or (
-                exporter.motion_blur_enabled and obj.luxcore.enable_motion_blur
-            )
-            or uses_displacement(obj)
-        )
+        use_instancing = _compute_use_instancing(exporter, dg_obj_instance, obj, is_viewport_render)
 
         mesh_key = self._get_mesh_key(obj, use_instancing, is_viewport_render)
 
@@ -720,13 +935,18 @@ class ObjectCache2:
             loaded_from_cache = False
 
         if exported_mesh:
+            # Check if object is in holdout layer collection (like Cycles)
+            # For instances, check the parent object (similar to visible_to_camera logic)
+            check_obj = dg_obj_instance.parent if dg_obj_instance.is_instance else obj
+            force_holdout = utils.is_holdout_object(check_obj.original, view_layer)
+
             mat_names = []
             for idx, (shape_name, mat_index) in enumerate(
                 exported_mesh.mesh_definitions
             ):
                 shape = shape_name
                 lux_mat_name, mat_props, node_tree = export_material(
-                    obj, mat_index, exporter, depsgraph, is_viewport_render
+                    obj, mat_index, exporter, depsgraph, is_viewport_render, force_holdout
                 )
                 scene_props.Set(mat_props)
                 mat_names.append(lux_mat_name)
@@ -742,16 +962,40 @@ class ObjectCache2:
                 exported_mesh.mesh_definitions[idx] = [shape, mat_index]
 
             obj_transform = transform.copy() if use_instancing else None
+            # Diagnostic (2026-09-23): tracking down origin/scale corruption
+            # on GN instance reappearance for objects with un-applied
+            # location/scale. use_instancing=False bakes the object's own
+            # transform into the cached mesh's vertex data (world-space,
+            # obj_transform stays None); use_instancing=True keeps the mesh
+            # in local space and sends obj_transform separately instead. If
+            # the SAME mesh_key ends up cached once with use_instancing=False
+            # (transform baked into vertices) and reused later with
+            # use_instancing=True (transform ALSO applied via
+            # obj_transform), the object's own transform would effectively
+            # apply twice -- this print is meant to catch exactly that.
+            print(f"  [diag] _convert_mesh_obj obj={obj.name!r} use_instancing={use_instancing} "
+                  f"mesh_key={mesh_key!r} loaded_from_cache={loaded_from_cache} "
+                  f"is_instance={dg_obj_instance.is_instance} "
+                  f"transform_translation={tuple(round(x, 4) for x in transform.translation)} "
+                  f"transform_scale={tuple(round(x, 4) for x in transform.to_scale())} "
+                  f"obj_transform={'None' if obj_transform is None else 'SET'}")
             obj_id = utils.make_object_id(dg_obj_instance)
+
+            visible = utils.visible_to_camera(
+                dg_obj_instance, is_viewport_render, view_layer
+            )
+
+            # Holdout overrides indirect_only - holdout needs object to be visible to camera
+            # to "cut a hole" in the film. In reflections/GI it will still be visible normally.
+            if force_holdout:
+                visible = True
 
             return ExportedObject(
                 obj_key,
                 exported_mesh.mesh_definitions,
                 mat_names,
                 obj_transform,
-                utils.visible_to_camera(
-                    dg_obj_instance, is_viewport_render, view_layer
-                ),
+                visible,
                 obj_id,
             )
 
@@ -761,11 +1005,11 @@ class ObjectCache2:
         )
         return depsgraph.id_type_updated("OBJECT") and not only_scene
 
-    def update(self, exporter, depsgraph, luxcore_scene, scene_props, context):
+    def update(self, exporter, depsgraph, luxcore_scene, scene_props, context, view_layer=None):
+        if view_layer is None:
+            view_layer = depsgraph.view_layer_eval
         is_viewport_render = bool(context)
         redefine_objs_with_these_mesh_keys = []
-        # Always instance in viewport so we can move objects around
-        use_instancing = True
 
         # Geometry updates (mesh edit, modifier edit etc.)
         if depsgraph.id_type_updated("OBJECT"):
@@ -774,9 +1018,9 @@ class ObjectCache2:
                     dg_update.id, bpy.types.Object
                 ):
                     obj = dg_update.id
-                    if not utils.is_obj_visible(
-                        obj
-                    ) or not obj.visible_in_viewport_get(context.space_data):
+                    if not utils.is_obj_visible(obj) or (
+                        context and not obj.visible_in_viewport_get(context.space_data)
+                    ):
                         continue
 
                     if obj.type in MESH_OBJECTS:
@@ -785,56 +1029,82 @@ class ObjectCache2:
                                 obj_key = utils.make_key(obj)
                                 del self.exported_hair[obj_key]
                         else:
-                            mesh_key = self._get_mesh_key(obj, use_instancing)
+                            # An object can be cached under up to two different
+                            # mesh_key variants depending on context:
+                            # use_instancing=True (shared local-space mesh, e.g.
+                            # for a GN/particle dupli of this object) and
+                            # use_instancing=False (singular object, world
+                            # transform baked into the mesh). Only refresh
+                            # whichever variant(s) are actually cached, each
+                            # with its own correct transform -- previously this
+                            # unconditionally used use_instancing=True (a
+                            # leftover meant only for viewport, "Always
+                            # instance in viewport so we can move objects
+                            # around"), which for a use_instancing=False
+                            # object computed the WRONG mesh_key. That wrong
+                            # key still landed in redefine_objs_with_these_
+                            # mesh_keys, which later forced a full re-convert
+                            # of the object further down in this method --
+                            # re-baking its world transform into the
+                            # ALREADY-baked mesh a second time (observed as
+                            # the object's scale/origin getting multiplied by
+                            # itself on the frame some unrelated Geometry
+                            # Nodes system first produced instances elsewhere
+                            # in the scene -- see
+                            # PERSISTENT_DATA_ANIMATION_NOTES.md).
+                            for candidate_instancing in (False, True):
+                                mesh_key = self._get_mesh_key(obj, candidate_instancing, is_viewport_render)
+                                if mesh_key not in self.exported_meshes:
+                                    continue
 
-                            # if mesh_key not in self.exported_meshes:
-                            # TODO this can happen if a deforming modifier is added
-                            #  to an already-exported object. how to handle this case?
+                                # if mesh_key not in self.exported_meshes:
+                                # TODO this can happen if a deforming modifier is added
+                                #  to an already-exported object. how to handle this case?
 
-                            transform = None  # In viewport render, everything is instanced
-                            exported_mesh = mesh_converter.convert(
-                                obj,
-                                mesh_key,
-                                depsgraph,
-                                luxcore_scene,
-                                is_viewport_render,
-                                use_instancing,
-                                transform,
-                            )
+                                transform = None if (is_viewport_render or candidate_instancing) else obj.matrix_world
+                                exported_mesh = mesh_converter.convert(
+                                    obj,
+                                    mesh_key,
+                                    depsgraph,
+                                    luxcore_scene,
+                                    is_viewport_render,
+                                    candidate_instancing,
+                                    transform,
+                                )
 
-                            if exported_mesh:
-                                for i in range(
-                                    len(exported_mesh.mesh_definitions)
-                                ):
-                                    shape, mat_index = (
-                                        exported_mesh.mesh_definitions[i]
-                                    )
-                                    mat = get_material(
-                                        obj, mat_index, depsgraph
-                                    )
+                                if exported_mesh:
+                                    for i in range(
+                                        len(exported_mesh.mesh_definitions)
+                                    ):
+                                        shape, mat_index = (
+                                            exported_mesh.mesh_definitions[i]
+                                        )
+                                        mat = get_material(
+                                            obj, mat_index, depsgraph
+                                        )
 
-                                    if mat:
-                                        node_tree = mat.luxcore.node_tree
-                                        if node_tree:
-                                            shape = define_shapes(
-                                                shape,
-                                                node_tree,
-                                                exporter,
-                                                depsgraph,
-                                                scene_props,
-                                            )
+                                        if mat:
+                                            node_tree = mat.luxcore.node_tree
+                                            if node_tree:
+                                                shape = define_shapes(
+                                                    shape,
+                                                    node_tree,
+                                                    exporter,
+                                                    depsgraph,
+                                                    scene_props,
+                                                )
 
-                                    exported_mesh.mesh_definitions[i] = (
-                                        shape,
-                                        mat_index,
-                                    )
+                                        exported_mesh.mesh_definitions[i] = (
+                                            shape,
+                                            mat_index,
+                                        )
 
-                            self.exported_meshes[mesh_key] = exported_mesh
+                                self.exported_meshes[mesh_key] = exported_mesh
 
-                            # We arrive here not only when the mesh is edited, but also when the material
-                            # of the object is changed in Blender. In this case we have to re-define all
-                            # objects using this mesh (just the properties, the mesh is not re-exported).
-                            redefine_objs_with_these_mesh_keys.append(mesh_key)
+                                # We arrive here not only when the mesh is edited, but also when the material
+                                # of the object is changed in Blender. In this case we have to re-define all
+                                # objects using this mesh (just the properties, the mesh is not re-exported).
+                                redefine_objs_with_these_mesh_keys.append(mesh_key)
 
                         # Re-export hair systems of objects with updated geometry
                         for psys in obj.particle_systems:
@@ -879,7 +1149,13 @@ class ObjectCache2:
                 continue
 
             obj_key = utils.make_key_from_instance(dg_obj_instance)
-            mesh_key = self._get_mesh_key(obj, use_instancing)
+            # Same formula _convert_mesh_obj() uses -- must match, since this
+            # decides whether we take the cheap transform-only update below or
+            # fall through to a full _convert_obj() (which recomputes this
+            # itself); using a different/wrong use_instancing here caused a
+            # real bug, see the comment above the "Geometry updates" loop.
+            use_instancing = _compute_use_instancing(exporter, dg_obj_instance, obj, is_viewport_render)
+            mesh_key = self._get_mesh_key(obj, use_instancing, is_viewport_render)
 
             if (
                 obj_key in self.exported_objects and obj.type != "LIGHT"
@@ -898,12 +1174,17 @@ class ObjectCache2:
                     exported_obj.obj_id = obj_id
                     updated = True
 
-                if exported_obj.visible_to_camera != utils.visible_to_camera(
-                    dg_obj_instance, is_viewport_render
-                ):
-                    exported_obj.visible_to_camera = utils.visible_to_camera(
-                        dg_obj_instance, is_viewport_render
-                    )
+                visible = utils.visible_to_camera(
+                    dg_obj_instance, is_viewport_render, view_layer
+                )
+
+                # Holdout overrides indirect_only
+                check_obj = dg_obj_instance.parent if dg_obj_instance.is_instance else dg_obj_instance.object
+                if utils.is_holdout_object(check_obj.original, view_layer):
+                    visible = True
+
+                if exported_obj.visible_to_camera != visible:
+                    exported_obj.visible_to_camera = visible
                     updated = True
 
                 if updated:
@@ -918,6 +1199,7 @@ class ObjectCache2:
                     luxcore_scene,
                     scene_props,
                     is_viewport_render,
+                    view_layer,
                 )
 
         # self._debug_info()
