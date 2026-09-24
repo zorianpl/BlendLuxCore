@@ -10,21 +10,38 @@ checkbox (off by default) -- see engine/final.py's _render_layer(),
 which dispatches here instead of the normal path only when that
 checkbox is on AND engine.is_animation is True.
 
+DESIGN: WHY NOTHING HERE READS BLENDER'S DEPSGRAPH FOR CHANGES.
+The obvious-looking alternative -- infer per-frame what changed from
+Blender's own dependency graph (depsgraph.updates / is_updated_geometry)
+the same way ObjectCache2.update() already does for viewport rendering
+-- was tried and rejected. It is not reliable enough to build this on:
+it can report a change far too broadly (a Geometry Nodes system
+producing new instances anywhere in the scene can spuriously flag
+completely unrelated, untouched objects as "geometry updated" on that
+same frame -- confirmed directly, see the notes: a static Cube got its
+scale doubled purely because some other GN system elsewhere first
+produced new instances that frame) and it can just as easily miss a
+real change that DOES need picking up. Either failure mode is worse
+than doing nothing automatically. So this mode instead follows the same
+model other renderers built around a persistent render session use
+(e.g. Octane): every object is exported once and treated as completely
+static afterwards, full stop -- no inference, no guessing from
+Blender's change-tracking metadata. The only way anything moves or
+changes after frame 1 is if you explicitly say so, per object (or per
+Geometry Nodes / Collection Instance parent), via
+obj.luxcore.always_reexport ("Always Re-check (Persistent Data)" in
+Object Properties > LuxCore). Everything not flagged stays on the fast,
+already-proven batched path; only the explicitly-flagged subset pays
+any per-frame cost at all.
+
 See PERSISTENT_DATA_ANIMATION_NOTES.md for the full history and the
 standalone test scripts this was proven in first
 (live_session_gui_test_addon.py and friends).
 
 KNOWN LIMITATIONS (opt-in only, normal rendering is entirely unaffected):
 - Only the camera and objects/instancing-parents with
-  obj.luxcore.always_reexport enabled ("Always Re-check (Persistent
-  Data)" in Object Properties > LuxCore) can move/change between
-  frames. Everything else is exported once on frame 1 and then frozen.
-- update_flagged_only() is untested for Geometry-Nodes-driven instance-
-  COUNT changes on a flagged group (that combination hit a different,
-  unrelated bug -- batch obj_key mismatch on delete -- when this method
-  was first written, see the notes) -- fine for a plain moving/rotating/
-  scaling mesh, not yet verified for a flagged GN duplicator whose
-  instance count varies frame to frame.
+  obj.luxcore.always_reexport enabled can move/change between frames.
+  Everything else is exported once on frame 1 and then frozen.
 - No live mid-frame scene editing: the normal
   engine.exporter.get_changes()/update_session() polling
   engine/final.py's _render_layer() does every loop iteration is

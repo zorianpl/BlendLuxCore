@@ -78,9 +78,9 @@ class LUXCORE_RENDER_PT_persistent_data_animation(RenderButtonsPanel, Panel):
         layout.enabled = config.use_persistent_data_animation
 
         layout.label(
-            text="Experimental -- only the camera can move between frames",
+            text="Experimental -- everything is frozen after frame 1 by default",
             icon=icons.WARNING,
         )
         layout.label(
-            text="Object/material/light/visibility changes are frozen after frame 1",
+            text="except the camera, and anything flagged 'Always Re-check' below",
         )

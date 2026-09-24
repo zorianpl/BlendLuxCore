@@ -72,11 +72,19 @@ ANIM_SEED_DESC = "Use different seed values for different frames"
 
 PERSISTENT_DATA_ANIMATION_DESC = (
     "Experimental: keep a single LuxCore render session alive across all "
-    "frames of an animation render, re-parsing only the camera each frame "
-    "instead of re-exporting and re-uploading the whole scene. Only the "
-    "camera can move between frames -- object, material, light, world "
-    "and visibility changes are exported once on the first frame and NOT "
-    "picked up afterwards. Has no effect on single-frame (F12) renders"
+    "frames of an animation render, instead of re-exporting and "
+    "re-uploading the whole scene from scratch on every frame. The camera "
+    "is always re-parsed each frame; everything else is exported once, on "
+    "the first frame, and then treated as static -- except objects (or "
+    "their Geometry Nodes / Collection Instance parent) with 'Always "
+    "Re-check (Persistent Data)' enabled in Object Properties, which are "
+    "re-checked and refreshed every frame too. This mirrors how other "
+    "engines with a similar persistent-session model (e.g. Octane) "
+    "handle animated scenes: nothing is inferred from Blender's own "
+    "change tracking, everything is static by default, and you "
+    "explicitly mark what actually needs to keep changing. See the "
+    "'Always Re-check' tooltip for why. Has no effect on single-frame "
+    "(F12) renders"
 )
 
 SOBOL_ADAPTIVE_STRENGTH_DESC = (
