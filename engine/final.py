@@ -11,6 +11,7 @@ from ..utils.errorlog import LuxCoreErrorLog
 from ..utils import view_layer as utils_view_layer
 from ..properties.denoiser import LuxCoreDenoiser
 from ..properties.display import LuxCoreDisplaySettings
+from . import persistent_data_animation
 
 if _needs_reload:
     import importlib
@@ -19,6 +20,7 @@ if _needs_reload:
     importlib.reload(utils)
     importlib.reload(draw)
     importlib.reload(properties)
+    importlib.reload(persistent_data_animation)
 
 
 def render(engine, depsgraph):
@@ -64,13 +66,17 @@ def render(engine, depsgraph):
         return
 
     print('[Engine/Final] Finished rendering layer "%s"' % layer.name)
-    
+
 
 def _render_layer(engine, depsgraph, statistics, view_layer):
+    scene = depsgraph.scene_eval
+    if scene.luxcore.config.use_persistent_data_animation and engine.is_animation:
+        persistent_data_animation.render_layer(engine, depsgraph, statistics, view_layer)
+        return
+
     engine.reset()
     engine.exporter = export.Exporter(statistics)
     engine.session = engine.exporter.create_session(depsgraph, engine=engine, view_layer=view_layer)
-    scene = depsgraph.scene_eval
 
     if engine.session is None:
         # session is None, but no error was thrown

@@ -70,6 +70,15 @@ SEED_DESC = (
 )
 ANIM_SEED_DESC = "Use different seed values for different frames"
 
+PERSISTENT_DATA_ANIMATION_DESC = (
+    "Experimental: keep a single LuxCore render session alive across all "
+    "frames of an animation render, re-parsing only the camera each frame "
+    "instead of re-exporting and re-uploading the whole scene. Only the "
+    "camera can move between frames -- object, material, light, world "
+    "and visibility changes are exported once on the first frame and NOT "
+    "picked up afterwards. Has no effect on single-frame (F12) renders"
+)
+
 SOBOL_ADAPTIVE_STRENGTH_DESC = (
     "A value of 0 means that each pixel is sampled equally, higher values "
     "focus more samples on noisy areas of the image"
@@ -555,6 +564,14 @@ class LuxCoreConfig(PropertyGroup):
     # Seed
     seed: IntProperty(name="Seed", default=1, min=1, description=SEED_DESC)
     use_animated_seed: BoolProperty(name="Animated Seed", default=False, description=ANIM_SEED_DESC)
+
+    # Persistent Data (Animation) -- see engine/final.py's
+    # _render_layer_persistent_data_animation() and
+    # PERSISTENT_DATA_ANIMATION_NOTES.md for the full background.
+    use_persistent_data_animation: BoolProperty(
+        name="Persistent Data (Animation)", default=False,
+        description=PERSISTENT_DATA_ANIMATION_DESC,
+    )
 
     # Min. epsilon settings (drawn in ui/units.py)
     show_min_epsilon: BoolProperty(name="Advanced LuxCore Settings", default=False,

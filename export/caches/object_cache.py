@@ -269,6 +269,18 @@ def supports_live_transform(particle_system):
     return total_particles <= MAX_PARTICLES_FOR_LIVE_TRANSFORM
 
 
+def _is_always_reexport_flagged(obj, dg_obj_instance):
+    """Whether obj (or its instancing parent) has obj.luxcore.always_reexport
+    set. Shared by _wants_individual_tracking() (viewport batching decision),
+    first_run()'s Persistent Data (Animation) key-seeding, and
+    Exporter.update_flagged_only() -- one place for this check instead of it
+    being copy-pasted in three places with a chance to drift out of sync."""
+    if getattr(obj.luxcore, "always_reexport", False):
+        return True
+    parent = dg_obj_instance.parent
+    return parent is not None and getattr(parent.luxcore, "always_reexport", False)
+
+
 def _wants_individual_tracking(obj, dg_obj_instance):
     # Hybrid batching merges same-mesh dupli instances into ONE
     # ExportedObject + N-1 DuplicateObject() copies in LuxCore; a batch is
@@ -297,12 +309,15 @@ def _wants_individual_tracking(obj, dg_obj_instance):
     # several minutes). Correctness for the few GN systems that actually
     # need this is back to being the user's responsibility to flag by hand;
     # see PERSISTENT_DATA_ANIMATION_NOTES.md for the reasoning either way.
-    parent = dg_obj_instance.parent
-    if getattr(obj.luxcore, "always_reexport", False):
-        return True
-    if parent is not None and getattr(parent.luxcore, "always_reexport", False):
-        return True
-    return False
+    #
+    # 2026-09-24: the caller (first_run(), see the "Persistent Data
+    # (Animation) exception" comment there) ignores this function's
+    # result entirely when exporter.persistent_data_animation is True
+    # -- that mode has its own, cheaper mechanism
+    # (Exporter.update_flagged_only()) for keeping a flagged group
+    # correctly updated across frames, and doesn't need frame 1 itself
+    # to pay the individual-tracking cost.
+    return _is_always_reexport_flagged(obj, dg_obj_instance)
 
 
 def _compute_use_instancing(exporter, dg_obj_instance, obj, is_viewport_render):
@@ -401,6 +416,7 @@ class ObjectCache2:
 
         for index, dg_obj_instance in enumerate(depsgraph.object_instances):
             obj = dg_obj_instance.object
+            is_flagged = _is_always_reexport_flagged(obj, dg_obj_instance)
 
             if (
                 dg_obj_instance.is_instance
@@ -412,8 +428,50 @@ class ObjectCache2:
                 )
                 and obj.type in MESH_OBJECTS
                 # Smart batching: always allow batching, group by (mesh, visibility) later
-                and not _wants_individual_tracking(obj, dg_obj_instance)
+                # Persistent Data (Animation) exception (2026-09-24):
+                # _wants_individual_tracking() exists so VIEWPORT's
+                # update() (which never re-batches) can still see and
+                # update a flagged object. That reasoning doesn't apply
+                # here -- update_flagged_only() (export/__init__.py)
+                # already correctly deletes+rebuilds the WHOLE bulk
+                # batch (base + all dupliN copies) for a flagged group
+                # when needed, and paying the individual-tracking cost
+                # on frame 1 (one _convert_obj() call per instance
+                # instead of one bulk DuplicateObject()) bought nothing
+                # yet, since nothing has changed on frame 1 -- confirmed
+                # by testing: forced this scene's whole flagged forest
+                # through individual conversion on frame 1 alone,
+                # turning a fast bulk export into an "insanely long"
+                # one, for no benefit. Skip it entirely in this mode.
+                and not (
+                    is_flagged
+                    and not getattr(exporter, "persistent_data_animation", False)
+                )
             ):
+                if not dg_obj_instance.show_self:
+                    # 2026-09-24 fix: a non-showing entry in a nested
+                    # instancing hierarchy (e.g. the "outer" Collection-
+                    # Info-level placeholder of a "Duplicate Collection"
+                    # GN setup -- see PERSISTENT_DATA_ANIMATION_NOTES.md,
+                    # "nested Collection-Info double-entry" -- both levels
+                    # can share this batch_key). _convert_obj() itself
+                    # already skips non-showing instances (checks
+                    # dg_obj_instance.show_self before exporting anything)
+                    # -- but if THIS happened to be the FIRST instance
+                    # encountered for a batch_key, the code below used to
+                    # permanently mark the whole batch unexportable
+                    # (instances[batch_key] = None), silently discarding
+                    # every OTHER, actually-showing instance of the same
+                    # mesh too (confirmed by testing: a whole flagged
+                    # Geometry Nodes forest never got exported at all on
+                    # some frames, with zero error/diagnostic output,
+                    # depending purely on which instance Blender's
+                    # enumeration happened to yield first that frame).
+                    # Skip it outright instead, touching `instances` not
+                    # at all, so the next instance sharing this batch_key
+                    # still gets a fresh, un-poisoned attempt.
+                    continue
+
                 # This code is optimized for large amounts of duplis. Drawback is that objects generated from this
                 # code can't be transformed later in a viewport render session (due to BlendLuxCore implementation
                 # reasons, not because of LuxCore)
@@ -444,6 +502,45 @@ class ObjectCache2:
                     # Fast batching: Simple key without per-instance overhead
                     # All instances assumed visible, no holdout/indirect_only checks
                     batch_key = (obj.original.as_pointer(), False, False)  # (mesh, camerainvisible=False, is_holdout=False)
+
+                # 2026-09-24 fix: batch_key above is PURELY by mesh identity
+                # -- it has no notion of which instancing source (GN
+                # modifier, plain Collection Instance, etc.) produced a
+                # given instance. Confirmed by testing: if a flagged
+                # object's mesh is ALSO instanced by some other,
+                # unflagged source (e.g. a second GN group, or a plain
+                # Collection Instance referencing the same Collection),
+                # they silently merge into ONE shared batch. Whichever
+                # source's instance is enumerated first becomes the
+                # batch's base -- if that happens to be the unflagged
+                # one, the flagged instances just get appended as extra
+                # duplicate matrices, the batch's key never enters
+                # Exporter.flagged_reexport_keys, and update_flagged_
+                # only() never touches it: an always_reexport-flagged
+                # group can look completely inert forever if it shares
+                # a mesh with anything unflagged. And if the base
+                # happens to belong to a flagged GN group instead,
+                # deleting that group's now-stale batch on disappearance
+                # wipes out every OTHER source's instances of the same
+                # mesh too, permanently (confirmed: two GN groups
+                # sharing one Collection, hiding the first made the
+                # second's instances vanish and never come back).
+                # Fix: segregate by instancing-parent identity too, but
+                # ONLY for flagged instances -- unflagged content keeps
+                # today's exact batch_key (None appended, same grouping,
+                # zero behavior/performance change for the vast majority
+                # of a scene that's never flagged). A flagged mesh shared
+                # by N distinct sources now gets up to N separate
+                # batches instead of one shared/ambiguous one -- each
+                # still one bulk DuplicateObject() call, cost scales
+                # with distinct SOURCES for that mesh, not instances.
+                if is_flagged:
+                    parent = dg_obj_instance.parent
+                    batch_key = batch_key + (
+                        parent.original.as_pointer() if parent else None,
+                    )
+                else:
+                    batch_key = batch_key + (None,)
 
                 try:
                     # The code in this try block is performance-critical, as it is
@@ -491,6 +588,22 @@ class ObjectCache2:
                         instances[batch_key] = Duplis(
                             exported_obj
                         )
+                        # Persistent Data (Animation) (2026-09-24): record
+                        # the exact obj_key this batch's base got registered
+                        # under, straight from THIS iteration's
+                        # dg_obj_instance -- not re-derived later by a
+                        # second, separate walk over depsgraph.
+                        # object_instances (confirmed by testing: a second
+                        # pass can genuinely land on a different "first"
+                        # instance than this one, silently pointing
+                        # Exporter.update_flagged_only()'s vanish-cleanup
+                        # at the wrong key). Only recorded in this mode --
+                        # normal/viewport rendering has no use for it.
+                        if getattr(exporter, "persistent_data_animation", False) \
+                                and is_flagged:
+                            exporter.flagged_reexport_keys.add(
+                                utils.make_key_from_instance(dg_obj_instance)
+                            )
                     else:
                         # Could not export the object, happens e.g. with curve objects with zero faces
                         instances[batch_key] = None

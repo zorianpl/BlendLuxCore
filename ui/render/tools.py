@@ -56,3 +56,31 @@ class LUXCORE_RENDER_PT_filesaver(RenderButtonsPanel, Panel):
         col = layout.column(align=True)
         col.prop(config, "filesaver_format")
         col.prop(config, "filesaver_path")
+
+
+class LUXCORE_RENDER_PT_persistent_data_animation(RenderButtonsPanel, Panel):
+    COMPAT_ENGINES = {"LUXCORE"}
+    bl_label = "Persistent Data (Animation)"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_parent_id = "LUXCORE_RENDER_PT_tools"
+
+    def draw_header(self, context):
+        layout = self.layout
+        config = context.scene.luxcore.config
+        layout.prop(config, "use_persistent_data_animation", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        config = context.scene.luxcore.config
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.enabled = config.use_persistent_data_animation
+
+        layout.label(
+            text="Experimental -- only the camera can move between frames",
+            icon=icons.WARNING,
+        )
+        layout.label(
+            text="Object/material/light/visibility changes are frozen after frame 1",
+        )

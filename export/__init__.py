@@ -22,7 +22,9 @@ from . import (
     mesh_converter,
 )
 from .light import WORLD_BACKGROUND_LIGHT_NAME
-from .caches.object_cache import supports_live_transform, Duplis
+from .caches.object_cache import (
+    supports_live_transform, Duplis, _is_always_reexport_flagged,
+)
 
 if _needs_reload:
     import importlib
@@ -114,6 +116,18 @@ class Exporter(object):
         # geometry) were not affected. Has no effect on a normal final
         # render (this flag stays False there).
         self.persistent_data_animation = False
+
+        # obj_keys of always_reexport-flagged groups exported by the last
+        # call to update_flagged_only() (see that method) -- lets it
+        # notice a flagged group that VANISHED (became invisible) since
+        # last call, so it can be explicitly removed from the live
+        # LuxCore scene. The main loop there only ever visits VISIBLE
+        # instances, so without this a flagged object that became
+        # invisible was never cleaned up at all (confirmed by testing:
+        # it stayed rendered forever, until it reappeared and the
+        # already-existing "drop old version before recreating" step
+        # incidentally deleted it one frame late).
+        self.flagged_reexport_keys = set()
 
         # A dictionary with the following mapping:
         # {node_key: luxcore_name}
@@ -573,6 +587,39 @@ class Exporter(object):
 
     def update_flagged_only(self, depsgraph, session, view_layer=None):
         """
+        2026-09-24 fix (v2 -- the first attempt was incomplete): a
+        flagged group that became INVISIBLE was never cleaned up at
+        all -- the main loop below only ever visits currently-visible
+        instances, so disappearance had no handler on its own.
+
+        self.flagged_reexport_keys tracks which obj_keys currently
+        belong to flagged groups, so a group missing from this call's
+        visible set can be explicitly removed below. It is seeded and
+        maintained in exactly TWO places, both computing obj_key from
+        the SAME dg_obj_instance that was actually used to create/find
+        the entry, in the SAME loop iteration -- never re-derived by a
+        separate, later walk over depsgraph.object_instances:
+        - first_run() (ObjectCache2.first_run(), object_cache.py),
+          right where it creates a NEW batch for a flagged group.
+        - This method's own loop, below.
+        The first version of this fix seeded flagged_reexport_keys via
+        a SEPARATE function (compute_flagged_visible_keys(), since
+        removed) that re-walked depsgraph.object_instances after
+        first_run() already ran and guessed which instance first_run()
+        had used as each batch's base. Confirmed by testing (real
+        production scene, a flagged Geometry-Nodes-driven forest) that
+        this guess is systematically wrong, not randomly: the "removed
+        N vanished group(s)" count was never 0, but the actual
+        `.pop(obj_key, None)` lookup silently missed every time,
+        deleting nothing (a coincidental, unrelated object happened to
+        share that count once, which is what made it initially look
+        like partial success). Instances stayed visible on every frame
+        of a present -> absent -> present test. Root-caused to the
+        second, independent walk landing on a different "first"
+        instance than first_run()'s own single pass did -- eliminated
+        entirely by recording the key at the source instead of
+        guessing it afterwards.
+
         v24 (2026-09-23): update_camera_only() plus a targeted, bulk
         refresh of exactly the objects/instancing-parents flagged with
         obj.luxcore.always_reexport -- nothing else. Still no
@@ -615,24 +662,36 @@ class Exporter(object):
             scene_props = pyluxcore.Properties()
             instances = {}
             dropped_keys = set()
+            seen_obj_keys = set()
+            seen_names = set()
+            flagged_but_filtered = []
 
             for dg_obj_instance in depsgraph.object_instances:
                 obj = dg_obj_instance.object
 
-                flagged = getattr(obj.luxcore, "always_reexport", False)
-                if not flagged and dg_obj_instance.is_instance:
-                    parent = dg_obj_instance.parent
-                    flagged = parent is not None and getattr(
-                        parent.luxcore, "always_reexport", False
-                    )
-                if not flagged:
+                if not _is_always_reexport_flagged(obj, dg_obj_instance):
                     continue
                 if obj.type not in utils.MESH_OBJECTS:
+                    flagged_but_filtered.append((obj.name, f"wrong type: {obj.type}"))
                     continue
                 if not utils.is_instance_visible(dg_obj_instance, obj, None):
+                    flagged_but_filtered.append((obj.name, "not visible"))
                     continue
 
-                batch_key = (obj.original.as_pointer(), False, False)
+                seen_names.add(obj.name)
+                # 2026-09-24: must match first_run()'s batch_key exactly
+                # (object_cache.py) -- segregated by instancing-parent
+                # identity too, so a flagged mesh shared with some OTHER,
+                # unflagged instancing source (or a second, independent
+                # flagged group) never merges into the same batch. Every
+                # instance reaching this point is already confirmed
+                # flagged (see the `continue` above), so this is
+                # unconditional here.
+                parent = dg_obj_instance.parent
+                batch_key = (
+                    obj.original.as_pointer(), False, False,
+                    parent.original.as_pointer() if parent else None,
+                )
 
                 if batch_key not in instances:
                     # First instance of this flagged group seen this call:
@@ -641,6 +700,7 @@ class Exporter(object):
                     if batch_key not in dropped_keys:
                         dropped_keys.add(batch_key)
                         obj_key = utils.make_key_from_instance(dg_obj_instance)
+                        seen_obj_keys.add(obj_key)
                         old = object_cache2.exported_objects.pop(obj_key, None)
                         if old is not None:
                             old.delete(luxcore_scene)
@@ -670,7 +730,32 @@ class Exporter(object):
 
             luxcore_scene.Parse(scene_props)
             object_cache2.duplicate_instances(instances, luxcore_scene, self.stats)
-            print(f"[update_flagged_only] refreshed {len(instances)} flagged group(s)")
+
+            # The loop above only ever visits VISIBLE instances -- a
+            # flagged group that became invisible since the last call
+            # never shows up in it at all, so without this it was never
+            # cleaned up. Remove anything we were tracking last call
+            # that didn't show up as visible+flagged this call. Every
+            # key in flagged_reexport_keys was recorded at its source
+            # (see this method's docstring) -- if pop() ever misses
+            # here now, that's a real, different bug, not the stale
+            # second-guess this replaced.
+            vanished_keys = self.flagged_reexport_keys - seen_obj_keys
+            actually_removed = 0
+            for obj_key in vanished_keys:
+                old = object_cache2.exported_objects.pop(obj_key, None)
+                if old is not None:
+                    old.delete(luxcore_scene)
+                    actually_removed += 1
+            self.flagged_reexport_keys = seen_obj_keys
+
+            print(
+                f"[update_flagged_only] refreshed {len(instances)} flagged "
+                f"group(s) {sorted(seen_names)}, {len(vanished_keys)} "
+                f"vanished (actually removed: {actually_removed})"
+            )
+            if flagged_but_filtered:
+                print(f"[update_flagged_only] flagged but skipped: {flagged_but_filtered}")
         except Exception as error:
             LuxCoreErrorLog.add_error(error)
             import traceback
