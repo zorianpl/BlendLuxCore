@@ -21,9 +21,10 @@ DESC_EXCLUDE_FROM_RENDER = (
 DESC_ALWAYS_REEXPORT = (
     "Force this object's instances to be re-checked every frame during a persistent-data "
     "animation render (mesh/material data is still cached, only the instance list is re-evaluated), "
-    "even if Blender's dependency graph does not flag a change. Use this for objects whose "
-    "Geometry Nodes visibility logic depends on something (e.g. camera position) that may not "
-    "reliably trigger automatic change detection"
+    "even if Blender's dependency graph does not flag a change. Use this for Geometry Nodes setups "
+    "whose instance count changes over the animation (e.g. instances appearing/disappearing) and "
+    "that don't reliably trigger automatic change detection otherwise. Leave disabled for stable "
+    "instance groups to keep them on the faster batched export path"
 )
 
 

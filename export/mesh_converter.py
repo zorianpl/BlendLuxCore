@@ -19,6 +19,18 @@ if _needs_reload:
     importlib.reload(caches)
     importlib.reload(utils)
 
+# Diagnostic (2026-09-23, PERSISTENT_DATA_ANIMATION_NOTES.md "ROOT CAUSE
+# FOUND AND FIXED" section): tracks shape names that have already been
+# DefineMeshExt()'d with a baked-in transformation (use_instancing=False
+# case, see below). If the SAME name gets baked again later, that's either
+# a legitimate re-bake with fresh geometry (fine, e.g. mesh actually
+# edited) or, if LuxCore's DefineMeshExt compounds the given
+# `transformation` with what a same-named shape already had instead of
+# replacing it outright, the exact mechanism of the origin/scale-doubling
+# bug. Deliberately never cleared -- any repeat bake across the whole run
+# is worth flagging regardless of when it happens.
+_baked_transform_names = set()
+
 
 # https://blenderartists.org/t/\
 # efficient-copying-of-vertex-coords-to-and-from-numpy-arrays/661467/2
@@ -197,6 +209,21 @@ def convert(
 
 
             print(f"[BLC] - Submesh #{mat:03d}: {len(mat_triangles)} triangles")
+
+            if mesh_transform is not None:
+                translation = (
+                    round(float(mesh_transform[0][3]), 5),
+                    round(float(mesh_transform[1][3]), 5),
+                    round(float(mesh_transform[2][3]), 5),
+                )
+                if name in _baked_transform_names:
+                    print(f"[diag] !!! RE-BAKE of {name!r} with a transformation -- "
+                          f"this shape name already had a transform baked in once "
+                          f"before. translation this bake: {translation}")
+                else:
+                    _baked_transform_names.add(name)
+                    print(f"[diag] first bake of {name!r} with a transformation "
+                          f"(use_instancing=False). translation: {translation}")
 
             luxcore_scene.DefineMeshExt(
                 name=name,

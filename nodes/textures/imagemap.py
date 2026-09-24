@@ -191,6 +191,18 @@ class LuxCoreNodeTexImagemap(base.LuxCoreNodeTexture, bpy.types.Node):
             utils.errorlog.LuxCoreErrorLog.add_warning(msg)
             return [1, 0, 1]
 
+        # Diagnostic (2026-09-23): tracking down a "file: 0" crash in
+        # LuxCore's MakeTx (ImageMap::MakeTx / OpenImageIO), see
+        # PERSISTENT_DATA_ANIMATION_NOTES.md. filepath should always be a
+        # real path string here; if it's ever falsy/not a string, that's
+        # the bug, caught at the exact point the "file" property gets its
+        # value, with the node/material/image names for context.
+        if not filepath or not isinstance(filepath, str):
+            print(f"[diag] !!! imagemap.py sub_export: bad filepath={filepath!r} "
+                  f"(type={type(filepath).__name__}) for node {self.name!r} in tree "
+                  f"{self.id_data.name!r}, image={self.image.name!r} "
+                  f"source={self.image.source!r}")
+
         definitions = {
             "type": "imagemap",
             "file": filepath,

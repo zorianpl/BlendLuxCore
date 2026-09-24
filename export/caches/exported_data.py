@@ -24,9 +24,12 @@ class ExportedObject(ExportedData):
         self.visible_to_camera = visible_to_camera
         self.obj_id = obj_id
         # Set by ObjectCache2.duplicate_instances() when this object is the base
-        # of a batch: LuxCore holds the other instances as a SEPARATE object per
-        # part, named "<part.lux_obj>dupli", that delete() below must also remove
-        self.has_duplicates = False
+        # of a batch: DuplicateObject() does not create one "<part.lux_obj>dupli"
+        # object, it creates one object PER extra instance, named
+        # "<part.lux_obj>dupli0", "...dupli1", ... "...dupli<count-1>" (confirmed
+        # via scene.ToProperties() dump), so delete() below must remove all of them
+        # or N-1 instances are left behind forever.
+        self.duplicate_count = 0
 
         for (shape_name, mat_index), mat_name in zip(mesh_definitions, mat_names):
             obj_name = lux_name_base + str(mat_index)
@@ -50,15 +53,12 @@ class ExportedObject(ExportedData):
         return utils.luxutils.create_props(prefix, definitions)
 
     def delete(self, luxcore_scene):
-        print(f"[ExportedObject.delete] has_duplicates={self.has_duplicates} parts={[p.lux_obj for p in self.parts]}")
         for part in self.parts:
             luxcore_scene.DeleteObject(part.lux_obj)
-            if self.has_duplicates:
-                # The rest of the batch's instances live in this separate,
-                # duplicated LuxCore object, not tracked as their own ExportedObject
-                dupli_name = part.lux_obj + "dupli"
-                print(f"[ExportedObject.delete] also deleting duplicated batch object: {dupli_name}")
-                luxcore_scene.DeleteObject(dupli_name)
+            for i in range(self.duplicate_count):
+                # The rest of the batch's instances live in these separate,
+                # duplicated LuxCore objects, not tracked as their own ExportedObject
+                luxcore_scene.DeleteObject(part.lux_obj + "dupli" + str(i))
 
 
 class ExportedLight(ExportedData):
