@@ -39,11 +39,15 @@ class ImageExporter:
             # Check whether packed image has already been exported
             try:
                 temp_image = cls.temp_images[key]
+            except KeyError:
+                # This is a new image
+                pass
+            else:
+                # This is an already exported image
                 print(f"[BLC] '{key}' already exported - skip")
                 result.append(temp_image.name)
                 continue
-            except KeyError:
-                pass
+
 
             # Compute filename extension
             if orig_filepath:
